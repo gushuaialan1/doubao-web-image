@@ -1,3 +1,5 @@
+#!/usr/bin/env ts-node
+
 import { DoubaoClient } from './doubao-webapi/client';
 import * as path from 'path';
 

@@ -26,15 +26,32 @@
 
 确保你已经安装了 Node.js (建议 v18+) 和 npm。
 
+### 方式一：直接全局安装（推荐）
+
+你可以直接通过 npm 从 GitHub 全局安装此工具，安装后可以在任意目录直接使用 `doubao-image` 命令：
+
 ```bash
-# 1. 安装项目依赖
+npm install -g git+https://github.com/pjf6568/doubao-web-image.git
+```
+*(注意：首次运行可能需要执行 `npx playwright install chromium` 来安装浏览器内核)*
+
+### 方式二：克隆到本地运行
+
+```bash
+# 1. 克隆项目
+git clone https://github.com/pjf6568/doubao-web-image.git
+cd doubao-web-image
+
+# 2. 安装项目依赖
 npm install
 
-# 2. 安装 Playwright 浏览器内核
+# 3. 安装 Playwright 浏览器内核
 npx playwright install chromium
 ```
 
 ## 🚀 使用方法
+
+如果你使用了**全局安装**，可以将下面所有的 `npx ts-node scripts/main.ts` 替换为简单的 `doubao-image` 命令。
 
 ### 1. 首次使用（需手动登录）
 由于项目需要获取你的登录 Cookie，第一次运行**必须带上 `--ui` 参数**以打开可视化浏览器：
