@@ -24,6 +24,8 @@ A Playwright-based web automation tool for generating images using Doubao Web.
 - 📏 **比例控制 (Aspect Ratio Control)**：支持通过自然语言参数自动拼接控制图片长宽比（如 `16:9`, `1:1`）。 / Supports controlling the image aspect ratio (e.g., `16:9`, `1:1`) by automatically appending parameters via natural language.
 - 🛡️ **验证码自动降级 (Auto-fallback for CAPTCHA)**：默认无头 (Headless) 模式运行，遇到风控拦截时自动弹窗切换到 UI 模式供人工验证。 / Runs in Headless mode by default, automatically popping up the UI mode for manual verification when encountering risk control interception.
 
+![Demo / 演示](./1.png)
+
 ## 📦 安装与配置 / Installation & Setup
 
 确保你已经安装了 Node.js (建议 v18+) 和 npm。
@@ -110,3 +112,12 @@ npx ts-node scripts/main.ts "星空下的赛博朋克城市" --ratio="9:16" --qu
   A: 脚本已内置自动重试机制。当在无头模式下遇到风控，脚本会自动关闭并以 UI 模式重启，给你 120 秒的时间在弹出的浏览器中手动完成滑块或点选验证码。 / The script has a built-in automatic retry mechanism. When encountering risk control in headless mode, the script will automatically close and restart in UI mode, giving you 120 seconds to manually complete the slider or point-and-click CAPTCHA in the popped-up browser.
 - **Q: 生成的图片大小只有几百 KB？ / Q: The generated image size is only a few hundred KB?**
   A: 确保没有加上 `--quality=preview` 参数。脚本默认会模拟点击大图并寻找下载按钮来获取 `image_pre_watermark` 级别的高清无损原图（通常 >1MB）。 / Ensure the `--quality=preview` parameter is not added. By default, the script will simulate clicking the large image and looking for the download button to get the `image_pre_watermark` level high-definition lossless original image (usually >1MB).
+
+---
+
+### 💬 联系与交流 / Contact & Communication
+
+这是我的微信公众号，欢迎关注交流！
+Welcome to follow my WeChat Official Account for communication and discussion!
+
+<img src="./2.jpg" width="300" alt="WeChat Official Account" />
