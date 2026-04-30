@@ -84,11 +84,12 @@ export class DoubaoClient {
         this.interceptedBuffers.clear();
         this.responseHandler = async (response: any) => {
             const url = response.url();
-            if (url.includes('flow-imagex-sign') && url.includes('image_pre_watermark')) {
+            // 拦截豆包图片 CDN 响应：包含 flow-imagex-sign 且不是缩略图/运营图
+            if (url.includes('flow-imagex-sign') && !url.includes('downsize') && !url.includes('web-operation') && !url.includes('avatar')) {
                 try {
                     const buffer = await response.body();
                     this.interceptedBuffers.set(url, buffer);
-                    console.log(`[DoubaoClient] 网络拦截: 捕获原图响应 (${buffer.length} bytes)`);
+                    console.log(`[DoubaoClient] 网络拦截: 捕获图片响应 (${buffer.length} bytes)`);
                 } catch (e) {
                     // ignore
                 }
