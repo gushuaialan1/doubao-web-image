@@ -160,7 +160,7 @@ impl DoubaoClient {
             let mut buffers = HashMap::new();
             while let Some(event) = events.next().await {
                 let url = &event.response.url;
-                if url.contains("flow-imagex-sign") && url.contains("image_pre_watermark") {
+                if url.contains("flow-imagex-sign") || url.contains("image_pre_watermark") {
                     match page_arc
                         .execute(GetResponseBodyParams::new(event.request_id.clone()))
                         .await
