@@ -74,13 +74,26 @@ doubao-web-image.exe "一只带有未来科技感的机器狗"
 | `--quality` | `preview` 或 `original`（默认） | `--quality=original` |
 | `--ratio` | 图片比例 | `--ratio=9:16` |
 | `--output` | 输出路径（默认 `generated.png`） | `--output=./wallpaper.png` |
+| `--no-watermark` | 去除左上角「AI 生成」水印 | `--no-watermark` |
 
 支持的图片比例：`1:1`, `2:3`, `3:4`, `4:3`, `9:16`, `16:9`
 
 ### 综合示例
 
+### 去除水印
+
+豆包生成的图片左上角带有「AI 生成」标签，可添加 `--no-watermark` 参数自动去除：
+
 ```bash
-doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --quality=original --output=./city_wallpaper.png
+doubao-web-image.exe "一只金毛犬坐在草地上" --no-watermark --output=dog.png
+```
+
+**去水印原理**：等比例放大整张图片，使水印区域被推出画面顶部，然后从中间区域裁切回原始尺寸。画面无拉伸变形，仅损失顶部和左右少量边缘内容。
+
+### 综合示例
+
+```bash
+doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --quality=original --no-watermark --output=./city_wallpaper.png
 ```
 
 ## 🐛 常见问题
