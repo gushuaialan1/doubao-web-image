@@ -101,8 +101,9 @@ Thumbs.db
 # Project specific
 debug-*.png
 debug-*.html
-*.png
-*.jpg
-*.jpeg
-*.webp
+debug-*.ts
+debug-*.json
+test_*.png
+test_*.jpg
+dist/
 .doubao-web-session/

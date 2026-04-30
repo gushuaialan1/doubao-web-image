@@ -71,6 +71,7 @@ Options:
     let client = new DoubaoClient();
     let imageUrl: string | null = null;
     let needsUiRetry = false;
+    let savedPath: string | null = null;
 
     try {
         console.log('--- 启动豆包生图客户端 ---');
@@ -80,13 +81,20 @@ Options:
         console.log(`\n任务: 生成图片 "${prompt}" (质量: ${quality}${ratio ? `, 比例: ${ratio}` : ''})`);
         imageUrl = await client.generateImage({ prompt, quality, ratio });
 
-        if (!imageUrl) {
-            if (headlessFlag) {
-                console.log('\n⚠️ 未能获取到图片，可能触发了人机验证或网络超时。');
-                needsUiRetry = true;
+        if (imageUrl) {
+            console.log('\n✅ 成功!');
+            console.log('图片链接:', imageUrl);
+            savedPath = await client.downloadWithPage(imageUrl, outputPath);
+            if (savedPath) {
+                console.log(`💾 图片已保存至: ${savedPath}`);
             } else {
-                console.log('\n❌ 失败: 无法获取图片链接。');
+                console.error('❌ 图片下载失败');
             }
+        } else if (headlessFlag) {
+            console.log('\n⚠️ 未能获取到图片，可能触发了人机验证或网络超时。');
+            needsUiRetry = true;
+        } else {
+            console.log('\n❌ 失败: 无法获取图片链接。');
         }
     } catch (error) {
         console.error('\n❌ 发生致命错误:', error);
@@ -97,7 +105,7 @@ Options:
         await client.close();
     }
 
-    if (needsUiRetry) {
+    if (needsUiRetry && !savedPath) {
         console.log('\n=============================================');
         console.log('🔄 正在自动以 UI 模式重启，以便进行手动验证...');
         console.log('💡 如果出现验证码，请在弹出的浏览器中手动完成验证。');
@@ -110,26 +118,22 @@ Options:
             // 给用户更多时间（比如 120 秒）来手动处理验证码
             imageUrl = await client.generateImage({ prompt, quality, ratio, timeout: 120000 });
             
-            if (!imageUrl) {
+            if (imageUrl) {
+                console.log('\n✅ 重试成功!');
+                console.log('图片链接:', imageUrl);
+                savedPath = await client.downloadWithPage(imageUrl, outputPath);
+                if (savedPath) {
+                    console.log(`💾 图片已保存至: ${savedPath}`);
+                } else {
+                    console.error('❌ 图片下载失败');
+                }
+            } else {
                 console.log('\n❌ 重试失败: 仍无法获取图片链接。');
             }
         } catch (e) {
             console.error('\n❌ UI 模式重试发生错误:', e);
         } finally {
             await client.close();
-        }
-    }
-
-    if (imageUrl) {
-        console.log('\n✅ 成功!');
-        console.log('图片链接:', imageUrl);
-        
-        // Download the image
-        const savedPath = await DoubaoClient.downloadImage(imageUrl, outputPath);
-        if (savedPath) {
-            console.log(`💾 图片已保存至: ${savedPath}`);
-        } else {
-            console.error('❌ 图片下载失败');
         }
     }
 }
