@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Suppress Node.js 20 deprecation warnings until actions are updated
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -23,14 +25,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: doubao-web-image.exe
             archive: doubao-web-image-windows-x64.zip
-          - os: macos-13
-            target: x86_64-apple-darwin
-            binary: doubao-web-image
-            archive: doubao-web-image-macos-x64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             binary: doubao-web-image
-            archive: doubao-web-image-macos-arm64.tar.gz
+            archive: doubao-web-image-macos.tar.gz
 
     runs-on: ${{ matrix.os }}
     steps:
