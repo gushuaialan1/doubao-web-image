@@ -23,11 +23,19 @@
 
 ### 方式一：下载预编译二进制（推荐）
 
-从 [Releases](https://github.com/gushuaialan1/doubao-web-image/releases) 页面下载对应平台的二进制文件。
+从 [Releases](https://github.com/gushuaialan1/doubao-web-image/releases/latest) 页面下载对应平台的二进制文件：
+
+| 平台 | 下载 | 大小 |
+|------|------|------|
+| Windows x64 | `doubao-web-image-windows-x64.zip` | ~3.7 MB |
+| Linux x64 | `doubao-web-image-linux-x64.tar.gz` | ~3.5 MB |
+| macOS (Apple Silicon / Intel*) | `doubao-web-image-macos.tar.gz` | ~3.2 MB |
+
+\* Intel Mac 用户可通过 Rosetta 运行 ARM64 版本
 
 **Windows 用户**：
 - 确保系统已安装 Chrome 或 Edge（Chromium 内核）
-- 双击 `doubao-web-image.exe` 即可运行
+- 解压后双击 `doubao-web-image.exe` 即可运行
 
 ### 方式二：从源码编译
 
