@@ -3,7 +3,9 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::{
     EventResponseReceived, GetResponseBodyParams,
 };
-use chromiumoxide::handler::viewport::Viewport;
+use chromiumoxide::cdp::browser_protocol::page::{
+    AddScriptToEvaluateOnNewDocumentParams, NavigateParams,
+};
 use chromiumoxide::Page;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures::StreamExt;
@@ -14,9 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::time::sleep;
 
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-const VIEWPORT_W: u32 = 1280;
-const VIEWPORT_H: u32 = 800;
+use crate::stealth;
 
 pub struct DoubaoClient {
     browser: Option<Browser>,
@@ -49,23 +49,12 @@ impl DoubaoClient {
             self.user_data_dir.display()
         );
 
-        let viewport = Viewport {
-            width: VIEWPORT_W,
-            height: VIEWPORT_H,
-            device_scale_factor: None,
-            emulating_mobile: false,
-            is_landscape: true,
-            has_touch: false,
-        };
+        let viewport = stealth::random_viewport();
 
         let mut config_builder = BrowserConfig::builder()
             .viewport(viewport)
             .user_data_dir(self.user_data_dir.clone())
-            .args(vec![
-                format!("--user-agent={}", USER_AGENT),
-                "--disable-blink-features=AutomationControlled".to_string(),
-                "--disable-infobars".to_string(),
-            ]);
+            .args(stealth::build_stealth_args());
         if !headless {
             config_builder = config_builder.with_head();
         }
@@ -82,7 +71,22 @@ impl DoubaoClient {
             }
         });
 
-        let page = Arc::new(browser.new_page("https://www.doubao.com/chat/").await?);
+        // Create blank page first, apply stealth, then navigate to target
+        let page = Arc::new(browser.new_page("about:blank").await?);
+
+        // Enable chromiumoxide built-in stealth + custom UA
+        page.enable_stealth_mode_with_agent(stealth::USER_AGENT).await?;
+
+        // Register supplemental stealth script for all future documents/iframes
+        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(stealth::STEALTH_SCRIPT))
+            .await?;
+
+        // Also inject into current blank page immediately
+        let _ = page.evaluate(stealth::STEALTH_SCRIPT).await?;
+
+        // Navigate to Doubao
+        page.goto(NavigateParams::new("https://www.doubao.com/chat/"))
+            .await?;
         page.wait_for_navigation().await?;
         sleep(Duration::from_millis(3000)).await;
 
@@ -201,12 +205,15 @@ impl DoubaoClient {
         ).await?;
         sleep(Duration::from_millis(500)).await;
 
-        // Count existing images
-        let before_count: i32 = page
-            .evaluate(r#"document.querySelectorAll('img[src*="flow-imagex-sign"]').length"#)
+        // Collect existing image URLs before sending
+        let before_urls: Vec<String> = page
+            .evaluate(r#"
+                Array.from(document.querySelectorAll('img[src*="flow-imagex-sign"]'))
+                    .map(img => img.getAttribute('src'))
+            "#)
             .await?
             .into_value()?;
-        println!("[DoubaoClient-Debug] 发送指令前，已有图片数量: {before_count}");
+        println!("[DoubaoClient-Debug] 发送指令前，已有图片数量: {}", before_urls.len());
 
         // Press Enter to send via CDP Input.dispatchKeyEvent (more reliable than element.press_key)
         use chromiumoxide::cdp::browser_protocol::input::{
@@ -234,7 +241,7 @@ impl DoubaoClient {
         ).await?;
         println!("[DoubaoClient] 已发送指令，等待图片生成...");
 
-        // Poll for new images
+        // Poll for NEW images (by URL diff, not just count)
         let start = Instant::now();
         let mut target_url: Option<String> = None;
         let mut poll_count = 0;
@@ -243,25 +250,34 @@ impl DoubaoClient {
             sleep(Duration::from_millis(2000)).await;
             poll_count += 1;
 
-            let current_count: i32 = page
-                .evaluate(r#"document.querySelectorAll('img[src*="flow-imagex-sign"]').length"#)
+            let current_urls: Vec<String> = page
+                .evaluate(r#"
+                    Array.from(document.querySelectorAll('img[src*="flow-imagex-sign"]'))
+                        .map(img => img.getAttribute('src'))
+                "#)
                 .await?
                 .into_value()?;
-            println!("[DoubaoClient-Debug] 第 {poll_count} 次轮询, 当前图片数量: {current_count}");
+            println!(
+                "[DoubaoClient-Debug] 第 {poll_count} 次轮询, 当前图片数量: {}",
+                current_urls.len()
+            );
 
-            if current_count > before_count {
-                let src: String = page
-                    .evaluate(r#"
-                        (function() {
-                            const imgs = document.querySelectorAll('img[src*="flow-imagex-sign"]');
-                            return imgs[imgs.length - 1].getAttribute('src');
-                        })()
-                    "#)
-                    .await?
-                    .into_value()?;
+            // Find URLs that appeared after we sent the message
+            let new_urls: Vec<String> = current_urls
+                .iter()
+                .filter(|url| !before_urls.contains(url))
+                .cloned()
+                .collect();
+
+            if !new_urls.is_empty() {
+                // Take the last new URL (most likely the newest generated image)
+                let newest = new_urls.last().unwrap().clone();
                 sleep(Duration::from_millis(3000)).await;
-                target_url = Some(src);
-                println!("[DoubaoClient] 检测到新图片生成");
+                target_url = Some(newest);
+                println!(
+                    "[DoubaoClient] 检测到新图片生成 (新增 {} 张)",
+                    new_urls.len()
+                );
                 break;
             }
         }
@@ -472,7 +488,7 @@ impl DoubaoClient {
         let resp = client
             .get(url)
             .header("Referer", "https://www.doubao.com/")
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", stealth::USER_AGENT)
             .send()
             .await?;
 
