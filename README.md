@@ -96,7 +96,7 @@ doubao-web-image.exe "一只带有未来科技感的机器狗"
 doubao-web-image.exe "一只金毛犬坐在草地上" --no-watermark --output=dog.png
 ```
 
-**去水印原理**：等比例放大整张图片，使水印区域被推出画面顶部，然后从中间区域裁切回原始尺寸。画面无拉伸变形，仅损失顶部和左右少量边缘内容。
+**去水印原理**：优先拦截 `/chat/completion` 的 SSE 数据流，直接提取服务端返回的 `image_ori_raw` 无水印原图 URL（借鉴 [doubao-nomark](https://github.com/gushuaialan1/doubao-nomark) 的解析思路）。如果拦截失败，则回退到等比例放大+顶部裁切的老方案，画面无拉伸变形，仅损失顶部和左右少量边缘内容。
 
 ### 综合示例
 
@@ -113,7 +113,7 @@ doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --quality=ori
   - A: 本工具依赖系统中已有的 Chrome/Edge。请确保已安装 Chrome 或 Microsoft Edge。
 
 - **Q: 生成的图片大小只有几百 KB？**
-  - A: 确保没有加上 `--quality=preview` 参数。脚本默认会获取 `image_pre_watermark` 级别的高清无损原图（通常 >1MB）。
+  - A: 确保没有加上 `--quality=preview` 参数。脚本默认会优先获取服务端返回的 `image_ori_raw` 无水印原图（通常 >1MB）；如果走回退逻辑，则获取 `image_pre_watermark` 级别的高清图。
 
 ## 🔧 技术栈
 

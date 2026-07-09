@@ -53,7 +53,8 @@ async fn run() -> Result<()> {
         Some(p) if !p.trim().is_empty() => p,
         _ => {
             // Print custom help with examples
-            println!(r#"
+            println!(
+                r#"
 豆包 Web 端自动化生图工具 (Rust + chromiumoxide)
 
 用法:
@@ -77,7 +78,8 @@ async fn run() -> Result<()> {
 
     指定比例和输出路径:
         doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --output=./wallpaper.png
-"#);
+"#
+            );
             return Ok(());
         }
     };
@@ -92,12 +94,21 @@ async fn run() -> Result<()> {
 
     let mut client = DoubaoClient::new()?;
     let mut needs_ui_retry = false;
-    let mut saved_path: Option<PathBuf> = None;
+    let mut saved_result: Option<(PathBuf, bool)> = None;
 
     // First attempt
-    match try_generate(&mut client, headless, &prompt, &quality, ratio, &output_path).await {
-        Ok(path) => {
-            saved_path = Some(path);
+    match try_generate(
+        &mut client,
+        headless,
+        &prompt,
+        &quality,
+        ratio,
+        &output_path,
+    )
+    .await
+    {
+        Ok((path, is_watermark_free)) => {
+            saved_result = Some((path, is_watermark_free));
         }
         Err(e) => {
             if headless {
@@ -112,7 +123,7 @@ async fn run() -> Result<()> {
     client.close().await;
 
     // UI retry if headless failed
-    if needs_ui_retry && saved_path.is_none() {
+    if needs_ui_retry && saved_result.is_none() {
         println!("\n=============================================");
         println!("🔄 正在自动以 UI 模式重启...");
         println!("💡 如果出现验证码，请在浏览器中手动完成。");
@@ -120,8 +131,8 @@ async fn run() -> Result<()> {
 
         let mut client = DoubaoClient::new()?;
         match try_generate(&mut client, false, &prompt, &quality, ratio, &output_path).await {
-            Ok(path) => {
-                saved_path = Some(path);
+            Ok((path, is_watermark_free)) => {
+                saved_result = Some((path, is_watermark_free));
             }
             Err(e) => {
                 eprintln!("\n❌ UI 模式重试失败: {e}");
@@ -130,16 +141,19 @@ async fn run() -> Result<()> {
         client.close().await;
     }
 
-    if let Some(path) = saved_path {
+    if let Some((path, is_watermark_free)) = saved_result {
         println!("\n✅ 成功!");
         println!("💾 图片已保存至: {}", path.display());
 
-        // Apply watermark removal if requested
-        if no_watermark {
+        // Apply watermark removal only when requested and the URL is not already
+        // the watermark-free original (image_ori_raw) extracted from the SSE stream.
+        if no_watermark && !is_watermark_free {
             match remove_watermark(&path) {
                 Ok(()) => println!("🧹 水印已去除"),
                 Err(e) => eprintln!("⚠️ 水印去除失败: {e}"),
             }
+        } else if no_watermark && is_watermark_free {
+            println!("🧹 已直接下载无水印原图，无需额外处理");
         }
     } else {
         std::process::exit(1);
@@ -149,7 +163,7 @@ async fn run() -> Result<()> {
 }
 
 fn remove_watermark(path: &PathBuf) -> Result<()> {
-    use image::{imageops, GenericImageView, ImageReader};
+    use image::{GenericImageView, ImageReader, imageops};
     use std::io::Cursor;
 
     println!("[Watermark] 正在去除水印...");
@@ -178,12 +192,7 @@ fn remove_watermark(path: &PathBuf) -> Result<()> {
     println!("[Watermark] 等比例放大至 {new_width}x{new_height} (scale={scale:.4})");
 
     // Scale up the entire image proportionally
-    let scaled = imageops::resize(
-        &img,
-        new_width,
-        new_height,
-        imageops::FilterType::Lanczos3,
-    );
+    let scaled = imageops::resize(&img, new_width, new_height, imageops::FilterType::Lanczos3);
 
     // After scaling, watermark occupies top (crop_px * scale) pixels
     // Crop starting from that offset, centered horizontally
@@ -197,7 +206,8 @@ fn remove_watermark(path: &PathBuf) -> Result<()> {
     // Save back
     let mut output_buf = Vec::new();
     let mut cursor = Cursor::new(&mut output_buf);
-    result.write_to(&mut cursor, image::ImageFormat::Png)
+    result
+        .write_to(&mut cursor, image::ImageFormat::Png)
         .map_err(|e| anyhow::anyhow!("Failed to encode image: {e}"))?;
 
     std::fs::write(path, &output_buf)?;
@@ -213,21 +223,30 @@ async fn try_generate(
     quality: &str,
     ratio: Option<&str>,
     output: &PathBuf,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, bool)> {
     client.init(headless).await?;
 
-    println!("\n任务: 生成图片 \"{prompt}\" (质量: {quality}{})",
+    println!(
+        "\n任务: 生成图片 \"{prompt}\" (质量: {quality}{})",
         ratio.map(|r| format!(", 比例: {r}")).unwrap_or_default()
     );
 
-    let image_url = client
+    let image_info = client
         .generate_image(prompt, quality, ratio, 120_000)
         .await?
         .ok_or_else(|| anyhow::anyhow!("未能获取图片 URL"))?;
 
     println!("\n✅ 成功!");
-    println!("图片链接: {image_url}");
+    println!(
+        "图片链接: {} {}",
+        image_info.url,
+        if image_info.is_watermark_free {
+            "(无水印原图)"
+        } else {
+            ""
+        }
+    );
 
-    let saved = client.download_with_page(&image_url, output).await?;
-    Ok(saved)
+    let saved = client.download_with_page(&image_info.url, output).await?;
+    Ok((saved, image_info.is_watermark_free))
 }
