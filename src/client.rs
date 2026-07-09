@@ -18,7 +18,7 @@ use crate::stealth;
 
 /// 注入到页面的 EventStream 拦截脚本。
 ///
-/// 借鉴 doubao-nomark 的浏览器插件思路：重写 `window.fetch`，
+/// 借鉴 doubao-nomark 的浏览器插件思路：重写 `window.fetch`（并兜底 `XMLHttpRequest`），
 /// 截获 `/chat/completion` 的 SSE 流并解析其中的 `image_ori_raw` 字段，
 /// 从而直接拿到豆包生成的无水印原图链接。
 const STREAM_INTERCEPTOR_SCRIPT: &str = r#"
@@ -26,11 +26,127 @@ const STREAM_INTERCEPTOR_SCRIPT: &str = r#"
     if (window.__doubaoInterceptorInstalled) return;
     window.__doubaoInterceptorInstalled = true;
     window.__doubaoImageOriRaws = window.__doubaoImageOriRaws || [];
+    window.__doubaoInterceptorDebug = {
+        fetchSeen: 0,
+        xhrSeen: 0,
+        matchedFetch: 0,
+        matchedXhr: 0,
+        parseErrors: 0,
+        lastError: null,
+    };
 
+    function getUrlString(input) {
+        if (typeof input === 'string') return input;
+        if (input && typeof input.url === 'string') return input.url;
+        if (input && typeof input.toString === 'function') return input.toString();
+        return '';
+    }
+
+    function tryParseImageOriRaw(data) {
+        try {
+            let creations = [];
+            if (Array.isArray(data.patch_op)) {
+                for (const op of data.patch_op) {
+                    if (op.patch_value && Array.isArray(op.patch_value.content_block)) {
+                        for (const block of op.patch_value.content_block) {
+                            const cb = block?.content?.creation_block;
+                            if (cb && Array.isArray(cb.creations)) {
+                                creations = cb.creations;
+                                break;
+                            }
+                        }
+                    }
+                    if (creations.length) break;
+                }
+                if (!creations.length) {
+                    const extPatch = data.patch_op.find(op =>
+                        op.patch_value && typeof op.patch_value === 'object' && op.patch_value.ext?.creation_full_content
+                    );
+                    if (extPatch) {
+                        try {
+                            const full = JSON.parse(extPatch.patch_value.ext.creation_full_content);
+                            for (const item of full) {
+                                const content = item?.BlockInfo?.BlockContent?.content;
+                                if (content && content.creation_block && Array.isArray(content.creation_block.creations)) {
+                                    creations = content.creation_block.creations;
+                                    break;
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+            } else if (data.event_data) {
+                try {
+                    const eventData = JSON.parse(data.event_data);
+                    if (eventData.message?.content) {
+                        const messageContent = JSON.parse(eventData.message.content);
+                        if (messageContent.creations && Array.isArray(messageContent.creations)) {
+                            creations = messageContent.creations;
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            for (const creation of creations) {
+                const imageData = creation?.image?.image_ori_raw;
+                if (!imageData) continue;
+                let imageUrl = '';
+                let width = 0;
+                let height = 0;
+                if (typeof imageData === 'string') {
+                    imageUrl = imageData;
+                } else if (typeof imageData === 'object' && imageData.url) {
+                    imageUrl = imageData.url;
+                    width = imageData.width || 0;
+                    height = imageData.height || 0;
+                }
+                if (imageUrl && !window.__doubaoImageOriRaws.find(img => img.url === imageUrl)) {
+                    window.__doubaoImageOriRaws.push({
+                        url: imageUrl.replace(/&amp;/g, '&'),
+                        width: width,
+                        height: height
+                    });
+                }
+            }
+        } catch (e) {
+            window.__doubaoInterceptorDebug.parseErrors += 1;
+            window.__doubaoInterceptorDebug.lastError = String(e);
+        }
+    }
+
+    // Buffer for SSE lines that span multiple fetch chunks.
+    let sseBuffer = '';
+    function feedSse(text) {
+        sseBuffer += text;
+        const lines = sseBuffer.split('\n');
+        // Keep the last (possibly incomplete) line in the buffer.
+        sseBuffer = lines.pop() || '';
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === '[DONE]') continue;
+            // Match both "data: {...}" and "data:{...}"
+            let jsonStr = '';
+            if (trimmed.startsWith('data:')) {
+                jsonStr = trimmed.substring(5).trim();
+            }
+            if (!jsonStr || !jsonStr.includes('image_ori')) continue;
+            try {
+                const data = JSON.parse(jsonStr);
+                tryParseImageOriRaw(data);
+            } catch (e) {
+                window.__doubaoInterceptorDebug.parseErrors += 1;
+                window.__doubaoInterceptorDebug.lastError = String(e);
+            }
+        }
+    }
+
+    // ===== Intercept fetch =====
     const originalFetch = window.fetch;
     window.fetch = async function(...args) {
-        const url = args[0];
-        if (typeof url === 'string' && url.includes('/chat/completion')) {
+        const url = getUrlString(args[0]);
+        window.__doubaoInterceptorDebug.fetchSeen += 1;
+        if (url && url.includes('/chat/completion')) {
+            window.__doubaoInterceptorDebug.matchedFetch += 1;
             try {
                 const response = await originalFetch.apply(this, args);
                 if (!response.body) return response;
@@ -42,7 +158,7 @@ const STREAM_INTERCEPTOR_SCRIPT: &str = r#"
                             const { done, value } = await reader.read();
                             if (done) break;
                             const chunk = decoder.decode(value, { stream: true });
-                            parseChunk(chunk);
+                            feedSse(chunk);
                             controller.enqueue(value);
                         }
                         controller.close();
@@ -54,93 +170,35 @@ const STREAM_INTERCEPTOR_SCRIPT: &str = r#"
                     statusText: response.statusText
                 });
             } catch (e) {
+                window.__doubaoInterceptorDebug.lastError = String(e);
                 return originalFetch.apply(this, args);
             }
         }
         return originalFetch.apply(this, args);
     };
 
-    function parseChunk(chunk) {
-        const lines = chunk.split('\n');
-        for (const line of lines) {
-            if (line.startsWith('data: ')) {
-                const jsonStr = line.substring(6).trim();
-                if (!jsonStr || jsonStr === '[DONE]') continue;
-                if (!jsonStr.includes('image_ori')) continue;
+    // ===== Intercept XMLHttpRequest as fallback =====
+    const originalXHROpen = XMLHttpRequest.prototype.open;
+    const originalXHRSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this._url = getUrlString(url);
+        return originalXHROpen.apply(this, [method, url, ...rest]);
+    };
+    XMLHttpRequest.prototype.send = function(...args) {
+        const url = this._url || '';
+        window.__doubaoInterceptorDebug.xhrSeen += 1;
+        if (url && url.includes('/chat/completion')) {
+            window.__doubaoInterceptorDebug.matchedXhr += 1;
+            this.addEventListener('load', function() {
                 try {
-                    const data = JSON.parse(jsonStr);
-                    parseData(data);
-                } catch (e) {}
-            }
-        }
-    }
-
-    function parseData(data) {
-        let creations = [];
-        if (Array.isArray(data.patch_op)) {
-            for (const op of data.patch_op) {
-                if (op.patch_value && Array.isArray(op.patch_value.content_block)) {
-                    for (const block of op.patch_value.content_block) {
-                        const cb = block?.content?.creation_block;
-                        if (cb && Array.isArray(cb.creations)) {
-                            creations = cb.creations;
-                            break;
-                        }
-                    }
+                    feedSse(this.responseText);
+                } catch (e) {
+                    window.__doubaoInterceptorDebug.lastError = String(e);
                 }
-                if (creations.length) break;
-            }
-            if (!creations.length) {
-                const extPatch = data.patch_op.find(op =>
-                    op.patch_value && typeof op.patch_value === 'object' && op.patch_value.ext?.creation_full_content
-                );
-                if (extPatch) {
-                    try {
-                        const full = JSON.parse(extPatch.patch_value.ext.creation_full_content);
-                        for (const item of full) {
-                            const content = item?.BlockInfo?.BlockContent?.content;
-                            if (content && content.creation_block && Array.isArray(content.creation_block.creations)) {
-                                creations = content.creation_block.creations;
-                                break;
-                            }
-                        }
-                    } catch (e) {}
-                }
-            }
-        } else if (data.event_data) {
-            try {
-                const eventData = JSON.parse(data.event_data);
-                if (eventData.message?.content) {
-                    const messageContent = JSON.parse(eventData.message.content);
-                    if (messageContent.creations && Array.isArray(messageContent.creations)) {
-                        creations = messageContent.creations;
-                    }
-                }
-            } catch (e) {}
+            });
         }
-
-        for (const creation of creations) {
-            const imageData = creation?.image?.image_ori_raw;
-            if (!imageData) continue;
-            let imageUrl = '';
-            let width = 0;
-            let height = 0;
-            if (typeof imageData === 'string') {
-                imageUrl = imageData;
-            } else if (typeof imageData === 'object' && imageData.url) {
-                imageUrl = imageData.url;
-                width = imageData.width || 0;
-                height = imageData.height || 0;
-            }
-            if (imageUrl && !window.__doubaoImageOriRaws.find(img => img.url === imageUrl)) {
-                window.__doubaoImageOriRaws.push({
-                    url: imageUrl.replace(/&amp;/g, '&'),
-                    width: width,
-                    height: height
-                });
-            }
-        }
-    }
+        return originalXHRSend.apply(this, args);
+    };
 })();
 "#;
 
@@ -149,6 +207,23 @@ struct ImageOriRawItem {
     url: String,
     width: u32,
     height: u32,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[allow(dead_code)]
+struct InterceptorDebug {
+    #[serde(default)]
+    fetch_seen: u32,
+    #[serde(default)]
+    xhr_seen: u32,
+    #[serde(default)]
+    matched_fetch: u32,
+    #[serde(default)]
+    matched_xhr: u32,
+    #[serde(default)]
+    parse_errors: u32,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 /// 生成结果信息。
@@ -776,9 +851,15 @@ impl DoubaoClient {
             }
 
             if poll_count % 4 == 0 {
+                let debug: InterceptorDebug = page
+                    .evaluate("window.__doubaoInterceptorDebug || {}")
+                    .await?
+                    .into_value()
+                    .unwrap_or_default();
                 println!(
-                    "[DoubaoClient-Debug] 等待无水印原图，当前缓存: {}",
-                    items.len()
+                    "[DoubaoClient-Debug] 等待无水印原图，当前缓存: {}，拦截器状态: {:?}",
+                    items.len(),
+                    debug
                 );
             }
         }
