@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chromiumoxide::Page;
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
 use chromiumoxide::cdp::browser_protocol::network::{EventResponseReceived, GetResponseBodyParams};
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, NavigateParams,
@@ -367,6 +368,7 @@ impl DoubaoClient {
         quality: &str,
         ratio: Option<&str>,
         timeout_ms: u64,
+        references: &[PathBuf],
     ) -> Result<Option<GeneratedImageInfo>> {
         let page = self
             .page
@@ -425,7 +427,12 @@ impl DoubaoClient {
             buffers
         });
 
-        // Find and fill textarea
+        // Upload reference images before typing the prompt
+        if !references.is_empty() {
+            self.upload_references(references).await?;
+        }
+
+        // Find and fill textarea (acquire after upload: React may re-render the input area)
         let textarea = self.wait_for_element("textarea", 10000).await?;
         textarea.click().await?;
         sleep(Duration::from_millis(200)).await;
@@ -668,6 +675,111 @@ impl DoubaoClient {
             url: target_url,
             is_watermark_free: false,
         }))
+    }
+
+    /// 上传参考图到聊天附件区。
+    ///
+    /// 豆包前端是 React SPA，文件输入框隐藏、且只在点击输入区「+」按钮后才挂载到 DOM，
+    /// 无法通过点击触发文件选择对话框（headless 下无法处理），因此流程为：
+    /// 1. 真实点击「+」按钮（CDP 鼠标事件，Radix 菜单依赖 pointer 事件）；
+    /// 2. 等待 `<input type="file">` 出现，用 CDP `DOM.setFileInputFiles` 注入文件路径；
+    /// 3. 等待缩略图（blob:）出现且上传进度（semi-progress-circle / loading-overlay）消失。
+    async fn upload_references(&self, paths: &[PathBuf]) -> Result<()> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not initialized"))?;
+        println!("[DoubaoClient] 正在上传 {} 张参考图...", paths.len());
+
+        // 确保页面已就绪
+        self.wait_for_element("textarea", 10000).await?;
+
+        // file input 未挂载时，先点击「+」按钮触发挂载
+        if page.find_element("input[type=\"file\"]").await.is_err() {
+            let tag_plus = r#"
+(function() {
+    const ta = document.querySelector('textarea');
+    if (!ta) return false;
+    let container = ta;
+    for (let i = 0; i < 7 && container.parentElement; i++) container = container.parentElement;
+    for (const btn of container.querySelectorAll('button')) {
+        const path = btn.querySelector('svg path');
+        if (path && (path.getAttribute('d') || '').startsWith('M12.0005 2.25')) {
+            btn.id = '__doubao_plus_btn';
+            return true;
+        }
+    }
+    return false;
+})()
+"#;
+            let tagged: bool = page.evaluate(tag_plus).await?.into_value()?;
+            if tagged {
+                let plus = page.find_element("#__doubao_plus_btn").await?;
+                plus.click().await?;
+                println!("[DoubaoClient] 已点击「+」按钮");
+            } else {
+                println!("[DoubaoClient] 未定位到「+」按钮，尝试直接等待文件输入框");
+            }
+        }
+
+        // 等待文件输入框出现
+        let input = self
+            .wait_for_element("input[type=\"file\"]", 10000)
+            .await
+            .map_err(|_| anyhow!("未找到文件上传输入框（豆包页面结构可能已变更）"))?;
+
+        // 通过 CDP 注入文件路径（input multiple=true，一次注入全部）
+        let files: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let mut params = SetFileInputFilesParams::new(files);
+        params.node_id = Some(input.node_id);
+        page.execute(params).await?;
+        println!("[DoubaoClient] 已注入参考图文件，等待上传完成...");
+
+        // 等待缩略图出现且上传进度消失（连续 2 轮稳定视为完成）
+        let expected = paths.len();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stable_rounds = 0u32;
+        loop {
+            if Instant::now() > deadline {
+                return Err(anyhow!("参考图上传超时（60s）"));
+            }
+            sleep(Duration::from_millis(1000)).await;
+            let status: serde_json::Value = page
+                .evaluate(
+                    r#"
+(function() {
+    const ta = document.querySelector('textarea');
+    if (!ta) return {thumbs: 0, uploading: false};
+    let container = ta;
+    for (let i = 0; i < 9 && container.parentElement; i++) container = container.parentElement;
+    const thumbs = container.querySelectorAll('img[src^="blob:"]').length;
+    const uploading = container.querySelectorAll(
+        '.semi-progress-circle, [class*="loading-overlay"], [class*="progress-text"]'
+    ).length > 0;
+    return {thumbs, uploading};
+})()
+"#,
+                )
+                .await?
+                .into_value()?;
+            let thumbs = status["thumbs"].as_u64().unwrap_or(0) as usize;
+            let uploading = status["uploading"].as_bool().unwrap_or(false);
+            println!(
+                "[DoubaoClient-Debug] 参考图上传状态: 缩略图 {thumbs}/{expected}, 上传中: {uploading}"
+            );
+            if thumbs >= expected && !uploading {
+                stable_rounds += 1;
+                if stable_rounds >= 2 {
+                    println!("[DoubaoClient] 参考图上传完成");
+                    return Ok(());
+                }
+            } else {
+                stable_rounds = 0;
+            }
+        }
     }
 
     async fn click_save_button(&self) -> Result<bool> {

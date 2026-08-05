@@ -15,6 +15,7 @@
 
 - 🤖 **免 API Key**：通过 `chromiumoxide` 模拟浏览器操作，直接复用网页版登录状态。
 - 🖼️ **高清大图下载**：自动拦截原生下载链接，获取 >3MB 的无损高分辨率原图。
+- 📎 **参考图上传**：`--reference` 上传本地参考图（最多 4 张），生图时保持主体/商品外观一致。
 - 📏 **比例控制**：支持通过自然语言参数控制图片长宽比（如 `16:9`, `1:1`）。
 - 🛡️ **验证码自动降级**：默认无头模式运行，遇到风控拦截时自动弹窗切换到 UI 模式。
 - ⚡ **单文件分发**：编译后单个 exe，无需 Node.js、无需 npm install、无需单独下载浏览器。
@@ -83,8 +84,27 @@ doubao-web-image.exe "一只带有未来科技感的机器狗"
 | `--ratio` | 图片比例 | `--ratio=9:16` |
 | `--output` | 输出路径（默认 `generated.png`） | `--output=./wallpaper.png` |
 | `--no-watermark` | 去除左上角「AI 生成」水印 | `--no-watermark` |
+| `--reference` | 参考图路径（可重复，最多 4 张，支持逗号分隔） | `--reference=./cover.png` |
 
 支持的图片比例：`1:1`, `2:3`, `3:4`, `4:3`, `9:16`, `16:9`
+
+### 参考图（保持主体外观一致）
+
+通过 `--reference` 先把本地图片上传到聊天附件区，再发送提示词，豆包会参考这些图生成结果（等价于网页版里「先拖入参考图再发文案」）。支持 `png/jpg/jpeg/webp`，单次最多 4 张：
+
+```bash
+# 单张参考图
+doubao-web-image.exe "参考这张图的构图，画一个古代书房场景" --reference=./room.png
+
+# 多张参考图（逗号分隔或重复传参均可）
+doubao-web-image.exe "参考这本书的封面和书脊，生成书桌上的商品展示图" --reference=./cover.png,./spine.png
+```
+
+推书场景示例（商品转化图，保持书籍外观一致）：
+
+```bash
+doubao-web-image.exe "参考这本书的装帧，生成一张放在复古木桌上的推书海报图，暖光氛围" --reference=./book-cover.png --ratio=3:4 --output=./book-promo.png
+```
 
 ### 综合示例
 

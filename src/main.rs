@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "doubao-web-image")]
 #[command(about = "豆包 Web 端自动化生图工具 (Rust + chromiumoxide)")]
-#[command(version = "1.0.0")]
+#[command(version = "1.3.0")]
 struct Args {
     /// 生图提示词
     #[arg(value_name = "PROMPT")]
@@ -35,6 +35,43 @@ struct Args {
     /// 去除左上角水印（AI 生成标签）
     #[arg(long)]
     no_watermark: bool,
+
+    /// 参考图路径（可重复，最多 4 张；也支持逗号分隔：--reference=a.png,b.png）
+    #[arg(long, value_name = "PATH", value_delimiter = ',')]
+    reference: Vec<PathBuf>,
+}
+
+/// 参考图数量上限
+const MAX_REFERENCES: usize = 4;
+
+/// 豆包附件输入框接受的图片格式
+const REFERENCE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+/// 校验参考图：文件必须存在、扩展名合法、数量不超过上限，返回规范化绝对路径。
+fn validate_references(inputs: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    if inputs.len() > MAX_REFERENCES {
+        anyhow::bail!("参考图最多 {MAX_REFERENCES} 张，实际提供了 {} 张", inputs.len());
+    }
+    let mut out = Vec::with_capacity(inputs.len());
+    for p in inputs {
+        if !p.is_file() {
+            anyhow::bail!("参考图不存在: {}", p.display());
+        }
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        if !REFERENCE_EXTS.contains(&ext.as_str()) {
+            anyhow::bail!(
+                "参考图仅支持 {} 格式: {}",
+                REFERENCE_EXTS.join("/"),
+                p.display()
+            );
+        }
+        out.push(std::fs::canonicalize(p)?);
+    }
+    Ok(out)
 }
 
 #[tokio::main]
@@ -66,6 +103,8 @@ async fn run() -> Result<()> {
     --ratio=<RATIO>         图片比例 (如: 16:9, 1:1, 9:16, 2:3, 3:4, 4:3)
     --output=<PATH>         输出文件路径 (默认: generated.png)
     --image=<PATH>          --output 的别名
+    --reference=<PATH>      参考图路径（可重复，最多 4 张；支持逗号分隔）
+    --no-watermark          去除左上角水印（AI 生成标签）
     -h, --help              显示帮助
     -V, --version           显示版本
 
@@ -78,6 +117,9 @@ async fn run() -> Result<()> {
 
     指定比例和输出路径:
         doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --output=./wallpaper.png
+
+    带参考图（保持商品外观一致，如推书场景）:
+        doubao-web-image.exe "参考这本书的封面，生成书桌上的展示图" --reference=./book-cover.png
 "#
             );
             return Ok(());
@@ -89,6 +131,7 @@ async fn run() -> Result<()> {
     let quality = args.quality;
     let ratio = args.ratio.as_deref();
     let no_watermark = args.no_watermark;
+    let references = validate_references(&args.reference)?;
 
     println!("--- 启动豆包生图客户端 ---");
 
@@ -104,6 +147,7 @@ async fn run() -> Result<()> {
         &quality,
         ratio,
         &output_path,
+        &references,
     )
     .await
     {
@@ -130,7 +174,17 @@ async fn run() -> Result<()> {
         println!("=============================================\n");
 
         let mut client = DoubaoClient::new()?;
-        match try_generate(&mut client, false, &prompt, &quality, ratio, &output_path).await {
+        match try_generate(
+            &mut client,
+            false,
+            &prompt,
+            &quality,
+            ratio,
+            &output_path,
+            &references,
+        )
+        .await
+        {
             Ok((path, is_watermark_free)) => {
                 saved_result = Some((path, is_watermark_free));
             }
@@ -223,16 +277,22 @@ async fn try_generate(
     quality: &str,
     ratio: Option<&str>,
     output: &PathBuf,
+    references: &[PathBuf],
 ) -> Result<(PathBuf, bool)> {
     client.init(headless).await?;
 
     println!(
-        "\n任务: 生成图片 \"{prompt}\" (质量: {quality}{})",
-        ratio.map(|r| format!(", 比例: {r}")).unwrap_or_default()
+        "\n任务: 生成图片 \"{prompt}\" (质量: {quality}{}{})",
+        ratio.map(|r| format!(", 比例: {r}")).unwrap_or_default(),
+        if references.is_empty() {
+            String::new()
+        } else {
+            format!(", 参考图: {} 张", references.len())
+        }
     );
 
     let image_info = client
-        .generate_image(prompt, quality, ratio, 120_000)
+        .generate_image(prompt, quality, ratio, 120_000, references)
         .await?
         .ok_or_else(|| anyhow::anyhow!("未能获取图片 URL"))?;
 
