@@ -16,6 +16,7 @@
 - 🤖 **免 API Key**：通过 `chromiumoxide` 模拟浏览器操作，直接复用网页版登录状态。
 - 🖼️ **高清大图下载**：自动拦截原生下载链接，获取 >3MB 的无损高分辨率原图。
 - 📎 **参考图上传**：`--reference` 上传本地参考图（最多 4 张），生图时保持主体/商品外观一致。
+- 📚 **同对话批量生图**：`--batch=plan.json` 在一个对话里先发全文文案、再连续发多条配图要求，人物/风格一致性更好。
 - 📏 **比例控制**：支持通过自然语言参数控制图片长宽比（如 `16:9`, `1:1`）。
 - 🛡️ **验证码自动降级**：默认无头模式运行，遇到风控拦截时自动弹窗切换到 UI 模式。
 - ⚡ **单文件分发**：编译后单个 exe，无需 Node.js、无需 npm install、无需单独下载浏览器。
@@ -85,8 +86,48 @@ doubao-web-image.exe "一只带有未来科技感的机器狗"
 | `--output` | 输出路径（默认 `generated.png`） | `--output=./wallpaper.png` |
 | `--no-watermark` | 去除左上角「AI 生成」水印 | `--no-watermark` |
 | `--reference` | 参考图路径（可重复，最多 4 张，支持逗号分隔） | `--reference=./cover.png` |
+| `--batch` | 同对话批量生图模式（plan.json 路径） | `--batch=plan.json` |
+| `--timeout-ms` | 每张图片的等待超时（毫秒；单图默认 120000，批量默认 180000） | `--timeout-ms=180000` |
 
 支持的图片比例：`1:1`, `2:3`, `3:4`, `4:3`, `9:16`, `16:9`
+
+### 同对话批量生图（--batch，保持人物/风格一致）
+
+单图模式每次调用都是全新对话，人物一致性差。`--batch` 复刻网页版手动流程：**打开一个对话，先发送整篇文案建立上下文，再连续发送多条配图要求**，所有图片在同一个对话中生成，一致性显著更好。
+
+```bash
+doubao-web-image.exe --batch=plan.json --timeout-ms=180000
+```
+
+`plan.json` 格式：
+
+```json
+{
+  "context": "可选。整篇文案，作为对话首条消息发出（纯文字，不期待图片产出），用于给豆包建立全文上下文",
+  "ratio": "9:16",
+  "quality": "original",
+  "noWatermark": true,
+  "items": [
+    { "prompt": "场景1的完整生图 prompt", "output": "E:/output/scene_00.png" },
+    { "prompt": "场景2的完整生图 prompt", "output": "E:/output/scene_01.png" }
+  ]
+}
+```
+
+行为说明：
+
+- `context` / `ratio` / `quality` / `noWatermark` 均可选（`quality` 默认 `original`，`noWatermark` 默认 `false`）；`items` 必填且非空，否则报错退出。
+- context 消息只等待 AI 回复停止（最长 30s），**不等待图片**。
+- 逐条发送 item 的 prompt，等待并下载图片到各自 `output` 路径（ratio/quality/noWatermark 逻辑与单图模式一致）。
+- **单张失败（超时/风控）只记录错误并继续下一张**，不整体中断。
+- 全部完成后 stdout 输出一行 JSON 摘要，供调用方解析：
+
+```json
+{"results":[{"output":"E:/output/scene_00.png","ok":true},{"output":"E:/output/scene_01.png","ok":false,"error":"等待图片超时（180000ms）"}]}
+```
+
+- 进程退出码：**全部失败才非零**（至少一张成功即退出码 0）。plan.json 解析失败或 items 为空时非零。
+- `--ui`（无头初始化失败时也会自动降级到 UI 模式）、`--timeout-ms`（每张图超时，默认 180s）同样可用。
 
 ### 参考图（保持主体外观一致）
 

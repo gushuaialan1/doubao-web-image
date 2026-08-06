@@ -362,6 +362,10 @@ impl DoubaoClient {
         Ok(())
     }
 
+    /// 单图模式入口：发送生图 prompt 并等待新图，返回最优图片 URL。
+    ///
+    /// 内部拆为「发送前快照 → send_message → wait_for_new_image」三步，
+    /// 批量模式（--batch）复用同一套逻辑在同一对话中逐条发送。
     pub async fn generate_image(
         &mut self,
         prompt: &str,
@@ -370,10 +374,6 @@ impl DoubaoClient {
         timeout_ms: u64,
         references: &[PathBuf],
     ) -> Result<Option<GeneratedImageInfo>> {
-        let page = self
-            .page
-            .as_ref()
-            .ok_or_else(|| anyhow!("Not initialized"))?;
         let final_prompt = match ratio {
             Some(r) => format!("{prompt}，图片比例 {r}"),
             None => prompt.to_string(),
@@ -384,9 +384,200 @@ impl DoubaoClient {
         // Clear previous intercepts
         self.intercepted_buffers.clear();
 
-        // Start network interception
+        // Start network interception (captures original image responses for this turn)
+        let mut intercept_task = self.spawn_response_interceptor()?;
+
+        // Collect existing image URLs / SSE cache count BEFORE sending so the wait
+        // logic can diff against what appears afterwards. Works in a shared
+        // conversation that already contains older images (batch mode).
+        let before_urls = self.current_image_urls().await?;
+        println!(
+            "[DoubaoClient-Debug] 发送指令前，已有图片数量: {}",
+            before_urls.len()
+        );
+        let before_ori_count = self.ori_raw_count().await.unwrap_or(0);
+        println!(
+            "[DoubaoClient-Debug] 发送指令前，无水印原图缓存: {}",
+            before_ori_count
+        );
+
+        // Upload references (if any), fill textarea and press Enter
+        self.send_message(&format!("帮我生成图片：{final_prompt}"), references)
+            .await?;
+        println!("[DoubaoClient] 已发送指令，等待图片生成...");
+
+        self.wait_for_new_image(
+            &mut intercept_task,
+            &before_urls,
+            before_ori_count,
+            quality,
+            timeout_ms,
+        )
+        .await
+    }
+
+    /// 在当前对话中发送一条消息（可选先上传参考图），立即返回，不等待任何回复。
+    ///
+    /// 单图模式与批量模式（context 消息、逐条生图 prompt）都通过它发送，
+    /// 因此批量模式下所有消息都落在同一个对话里。
+    pub async fn send_message(&self, text: &str, references: &[PathBuf]) -> Result<()> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not initialized"))?;
+
+        // Upload reference images before typing the prompt
+        if !references.is_empty() {
+            self.upload_references(references).await?;
+        }
+
+        // Find and fill textarea (acquire after upload: React may re-render the input area)
+        let textarea = self.wait_for_element("textarea", 10000).await?;
+        textarea.click().await?;
+        sleep(Duration::from_millis(200)).await;
+
+        // Insert text via CDP Input.insertText (triggers React onChange, send button appears)
+        page.execute(
+            chromiumoxide::cdp::browser_protocol::input::InsertTextParams::new(text),
+        )
+        .await?;
+        sleep(Duration::from_millis(500)).await;
+
+        // Press Enter to send via CDP Input.dispatchKeyEvent (more reliable than element.press_key)
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+        page.execute(
+            DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyDown)
+                .key("Enter")
+                .code("Enter")
+                .windows_virtual_key_code(13)
+                .native_virtual_key_code(13)
+                .build()
+                .unwrap(),
+        )
+        .await?;
+        page.execute(
+            DispatchKeyEventParams::builder()
+                .r#type(DispatchKeyEventType::KeyUp)
+                .key("Enter")
+                .code("Enter")
+                .windows_virtual_key_code(13)
+                .native_virtual_key_code(13)
+                .build()
+                .unwrap(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 发送纯文本上下文消息（不期待图片产出），给豆包建立全文上下文。
+    ///
+    /// 发送后等待 AI 回复「开始并停止」：先等页面文本长度增长（回复开始，最多 10s），
+    /// 再等文本长度连续 3s 不再变化（回复停止）。无论回复是否完整，最多等待
+    /// timeout_ms 后返回；全程不触发任何等图逻辑。
+    pub async fn send_context_message(&mut self, text: &str, timeout_ms: u64) -> Result<()> {
+        let page = Arc::clone(
+            self.page
+                .as_ref()
+                .ok_or_else(|| anyhow!("Not initialized"))?,
+        );
+
+        self.send_message(text, &[]).await?;
+        println!(
+            "[DoubaoClient] 上下文消息已发送，等待 AI 回复停止（最长 {}s）...",
+            timeout_ms / 1000
+        );
+
+        // 等本地回显渲染完再取基线，避免把自己消息的渲染误判成 AI 回复开始
+        sleep(Duration::from_millis(1500)).await;
+        let baseline: usize = page
+            .evaluate("document.body.innerText.length")
+            .await?
+            .into_value()?;
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        // Phase 1: 等 AI 回复开始（最多 10s，且不超过总 deadline）
+        let start_deadline = (Instant::now() + Duration::from_secs(10)).min(deadline);
+        let mut reply_started = false;
+        while Instant::now() < start_deadline {
+            sleep(Duration::from_millis(1000)).await;
+            let len: usize = page
+                .evaluate("document.body.innerText.length")
+                .await?
+                .into_value()?;
+            if len > baseline {
+                reply_started = true;
+                break;
+            }
+        }
+        if !reply_started {
+            println!("[DoubaoClient] 未检测到文字回复，直接继续后续流程");
+            return Ok(());
+        }
+        println!("[DoubaoClient] 检测到 AI 开始回复，等待回复停止...");
+
+        // Phase 2: 等回复停止（连续 3 轮页面文本长度不变视为停止）
+        let mut last_len = 0usize;
+        let mut stable_rounds = 0u32;
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(1000)).await;
+            let len: usize = page
+                .evaluate("document.body.innerText.length")
+                .await?
+                .into_value()?;
+            if len == last_len {
+                stable_rounds += 1;
+                if stable_rounds >= 3 {
+                    println!("[DoubaoClient] AI 回复已停止，继续后续流程");
+                    return Ok(());
+                }
+            } else {
+                stable_rounds = 0;
+                last_len = len;
+            }
+        }
+
+        println!(
+            "[DoubaoClient] 等待回复超时（{}s），继续后续流程",
+            timeout_ms / 1000
+        );
+        Ok(())
+    }
+
+    /// 当前对话 DOM 中所有已渲染生图缩略图的 URL 列表。
+    async fn current_image_urls(&self) -> Result<Vec<String>> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not initialized"))?;
+        let urls: Vec<String> = page
+            .evaluate(
+                r#"
+                Array.from(document.querySelectorAll('img[src*="flow-imagex-sign"]'))
+                    .map(img => img.getAttribute('src'))
+            "#,
+            )
+            .await?
+            .into_value()?;
+        Ok(urls)
+    }
+
+    /// 启动网络响应拦截任务：捕获本轮回合中 flow-imagex-sign / image_pre_watermark
+    /// 的响应体，供 download_with_page 直接使用内存数据保存原图。
+    ///
+    /// 返回的 JoinHandle 由调用方在等待结束后收集并 abort，避免批量模式下任务堆积。
+    fn spawn_response_interceptor(
+        &self,
+    ) -> Result<tokio::task::JoinHandle<HashMap<String, Vec<u8>>>> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not initialized"))?;
         let page_arc = Arc::clone(page);
-        let intercept_task = tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
             let mut events = match page_arc.event_listener::<EventResponseReceived>().await {
                 Ok(e) => e,
                 Err(e) => {
@@ -425,75 +616,27 @@ impl DoubaoClient {
                 }
             }
             buffers
-        });
+        }))
+    }
 
-        // Upload reference images before typing the prompt
-        if !references.is_empty() {
-            self.upload_references(references).await?;
-        }
-
-        // Find and fill textarea (acquire after upload: React may re-render the input area)
-        let textarea = self.wait_for_element("textarea", 10000).await?;
-        textarea.click().await?;
-        sleep(Duration::from_millis(200)).await;
-
-        // Insert text via CDP Input.insertText (triggers React onChange, send button appears)
-        let fill_text = format!("帮我生成图片：{final_prompt}");
-        page.execute(
-            chromiumoxide::cdp::browser_protocol::input::InsertTextParams::new(&fill_text),
-        )
-        .await?;
-        sleep(Duration::from_millis(500)).await;
-
-        // Collect existing image URLs before sending
-        let before_urls: Vec<String> = page
-            .evaluate(
-                r#"
-                Array.from(document.querySelectorAll('img[src*="flow-imagex-sign"]'))
-                    .map(img => img.getAttribute('src'))
-            "#,
-            )
-            .await?
-            .into_value()?;
-        println!(
-            "[DoubaoClient-Debug] 发送指令前，已有图片数量: {}",
-            before_urls.len()
+    /// 等待当前对话中出现「发送前快照之后新增」的图片，并按 quality 提取最优 URL。
+    ///
+    /// before_urls / before_ori_count 由调用方在发送消息前快照，同一对话里已有的
+    /// 旧图不会被误判为新图（批量模式的关键）。如果豆包一次回复多张候选图，
+    /// 沿用既有策略取最新（最后）一张。
+    async fn wait_for_new_image(
+        &mut self,
+        intercept_task: &mut tokio::task::JoinHandle<HashMap<String, Vec<u8>>>,
+        before_urls: &[String],
+        before_ori_count: usize,
+        quality: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<GeneratedImageInfo>> {
+        let page = Arc::clone(
+            self.page
+                .as_ref()
+                .ok_or_else(|| anyhow!("Not initialized"))?,
         );
-
-        // Record current count of intercepted watermark-free images
-        let before_ori_count = self.ori_raw_count().await.unwrap_or(0);
-        println!(
-            "[DoubaoClient-Debug] 发送指令前，无水印原图缓存: {}",
-            before_ori_count
-        );
-
-        // Press Enter to send via CDP Input.dispatchKeyEvent (more reliable than element.press_key)
-        use chromiumoxide::cdp::browser_protocol::input::{
-            DispatchKeyEventParams, DispatchKeyEventType,
-        };
-        page.execute(
-            DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyDown)
-                .key("Enter")
-                .code("Enter")
-                .windows_virtual_key_code(13)
-                .native_virtual_key_code(13)
-                .build()
-                .unwrap(),
-        )
-        .await?;
-        page.execute(
-            DispatchKeyEventParams::builder()
-                .r#type(DispatchKeyEventType::KeyUp)
-                .key("Enter")
-                .code("Enter")
-                .windows_virtual_key_code(13)
-                .native_virtual_key_code(13)
-                .build()
-                .unwrap(),
-        )
-        .await?;
-        println!("[DoubaoClient] 已发送指令，等待图片生成...");
 
         // Enforce the overall timeout across both SSE interception and DOM polling.
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -508,6 +651,7 @@ impl DoubaoClient {
             let ori_timeout = remaining.saturating_sub(20_000).max(30_000);
             if let Some(item) = self.poll_new_ori_raw(before_ori_count, ori_timeout).await? {
                 println!("[DoubaoClient] 已获取无水印原图 URL，跳过模态框提取");
+                intercept_task.abort();
                 return Ok(Some(GeneratedImageInfo {
                     url: item.url,
                     is_watermark_free: true,
@@ -524,15 +668,7 @@ impl DoubaoClient {
             sleep(Duration::from_millis(2000)).await;
             poll_count += 1;
 
-            let current_urls: Vec<String> = page
-                .evaluate(
-                    r#"
-                    Array.from(document.querySelectorAll('img[src*="flow-imagex-sign"]'))
-                        .map(img => img.getAttribute('src'))
-                "#,
-                )
-                .await?
-                .into_value()?;
+            let current_urls = self.current_image_urls().await?;
             println!(
                 "[DoubaoClient-Debug] 第 {poll_count} 次轮询, 当前图片数量: {}",
                 current_urls.len()
@@ -562,12 +698,14 @@ impl DoubaoClient {
             Some(u) => u,
             None => {
                 println!("[DoubaoClient] 等待图片超时");
+                intercept_task.abort();
                 return Ok(None);
             }
         };
 
         // If preview only, return immediately
         if quality == "preview" {
+            intercept_task.abort();
             return Ok(Some(GeneratedImageInfo {
                 url: target_url,
                 is_watermark_free: false,
@@ -630,12 +768,14 @@ impl DoubaoClient {
             .await?
             .into_value()?;
 
-        // 4. Collect intercepted buffers
+        // 4. Collect intercepted buffers, then stop the interceptor for this turn
         sleep(Duration::from_millis(1000)).await;
-        let intercepted = match tokio::time::timeout(Duration::from_secs(2), intercept_task).await {
-            Ok(Ok(bufs)) => bufs,
-            _ => HashMap::new(),
-        };
+        let intercepted =
+            match tokio::time::timeout(Duration::from_secs(2), &mut *intercept_task).await {
+                Ok(Ok(bufs)) => bufs,
+                _ => HashMap::new(),
+            };
+        intercept_task.abort();
         self.intercepted_buffers = intercepted;
 
         if !self.intercepted_buffers.is_empty() {

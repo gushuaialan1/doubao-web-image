@@ -6,11 +6,15 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "doubao-web-image")]
 #[command(about = "豆包 Web 端自动化生图工具 (Rust + chromiumoxide)")]
-#[command(version = "1.3.0")]
+#[command(version = "1.4.0")]
 struct Args {
     /// 生图提示词
     #[arg(value_name = "PROMPT")]
     prompt: Option<String>,
+
+    /// 同对话批量生图模式：plan.json 计划文件路径（提供后忽略位置参数 PROMPT）
+    #[arg(long, value_name = "PLAN_JSON")]
+    batch: Option<PathBuf>,
 
     /// 显示浏览器窗口（首次登录必须带此参数）
     #[arg(long)]
@@ -39,6 +43,10 @@ struct Args {
     /// 参考图路径（可重复，最多 4 张；也支持逗号分隔：--reference=a.png,b.png）
     #[arg(long, value_name = "PATH", value_delimiter = ',')]
     reference: Vec<PathBuf>,
+
+    /// 每张图片的等待超时（毫秒）。单图模式默认 120000，批量模式默认 180000
+    #[arg(long, value_name = "MS")]
+    timeout_ms: Option<u64>,
 }
 
 /// 参考图数量上限
@@ -85,6 +93,11 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = Args::parse();
 
+    // 同对话批量生图模式：--batch=plan.json 时忽略位置参数 PROMPT
+    if let Some(plan_path) = &args.batch {
+        return run_batch(plan_path, &args).await;
+    }
+
     // If no prompt provided, show help
     let prompt = match args.prompt {
         Some(p) if !p.trim().is_empty() => p,
@@ -96,6 +109,7 @@ async fn run() -> Result<()> {
 
 用法:
     doubao-web-image.exe "<提示词>" [选项]
+    doubao-web-image.exe --batch=plan.json [选项]
 
 选项:
     --ui                    显示浏览器窗口（首次登录必须带此参数）
@@ -105,6 +119,8 @@ async fn run() -> Result<()> {
     --image=<PATH>          --output 的别名
     --reference=<PATH>      参考图路径（可重复，最多 4 张；支持逗号分隔）
     --no-watermark          去除左上角水印（AI 生成标签）
+    --batch=<PLAN_JSON>     同对话批量生图模式（plan.json 描述 context 与 items）
+    --timeout-ms=<MS>       每张图片的等待超时（单图默认 120000，批量默认 180000）
     -h, --help              显示帮助
     -V, --version           显示版本
 
@@ -120,6 +136,9 @@ async fn run() -> Result<()> {
 
     带参考图（保持商品外观一致，如推书场景）:
         doubao-web-image.exe "参考这本书的封面，生成书桌上的展示图" --reference=./book-cover.png
+
+    同对话批量生图（保持人物/风格一致性）:
+        doubao-web-image.exe --batch=plan.json --timeout-ms=180000
 "#
             );
             return Ok(());
@@ -132,6 +151,7 @@ async fn run() -> Result<()> {
     let ratio = args.ratio.as_deref();
     let no_watermark = args.no_watermark;
     let references = validate_references(&args.reference)?;
+    let timeout_ms = args.timeout_ms.unwrap_or(120_000);
 
     println!("--- 启动豆包生图客户端 ---");
 
@@ -148,6 +168,7 @@ async fn run() -> Result<()> {
         ratio,
         &output_path,
         &references,
+        timeout_ms,
     )
     .await
     {
@@ -182,6 +203,7 @@ async fn run() -> Result<()> {
             ratio,
             &output_path,
             &references,
+            timeout_ms,
         )
         .await
         {
@@ -278,6 +300,7 @@ async fn try_generate(
     ratio: Option<&str>,
     output: &PathBuf,
     references: &[PathBuf],
+    timeout_ms: u64,
 ) -> Result<(PathBuf, bool)> {
     client.init(headless).await?;
 
@@ -292,7 +315,7 @@ async fn try_generate(
     );
 
     let image_info = client
-        .generate_image(prompt, quality, ratio, 120_000, references)
+        .generate_image(prompt, quality, ratio, timeout_ms, references)
         .await?
         .ok_or_else(|| anyhow::anyhow!("未能获取图片 URL"))?;
 
@@ -309,4 +332,205 @@ async fn try_generate(
 
     let saved = client.download_with_page(&image_info.url, output).await?;
     Ok((saved, image_info.is_watermark_free))
+}
+
+// ==================== 同对话批量生图模式（--batch） ====================
+
+/// 批量计划文件（plan.json）。
+#[derive(Debug, serde::Deserialize)]
+struct BatchPlan {
+    /// 可选。整篇文案，作为对话首条消息发出（纯文字，不期待图片产出），
+    /// 用于给豆包建立全文上下文。
+    context: Option<String>,
+
+    /// 图片比例（如 9:16），应用到所有 item
+    ratio: Option<String>,
+
+    /// 图片质量：preview 或 original，默认 original
+    quality: Option<String>,
+
+    /// 是否去除左上角水印（AI 生成标签）
+    #[serde(default, rename = "noWatermark", alias = "no_watermark")]
+    no_watermark: bool,
+
+    /// 生图条目，逐个在同一对话中发送
+    items: Vec<BatchItem>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BatchItem {
+    /// 完整生图 prompt
+    prompt: String,
+    /// 输出文件路径（建议绝对路径）
+    output: PathBuf,
+}
+
+/// 单个 item 的执行结果（序列化进 stdout 的 JSON 摘要）。
+#[derive(Debug, serde::Serialize)]
+struct BatchResultItem {
+    output: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// 同对话批量生图：打开一个豆包对话，先发可选的 context，再逐条发送 items 的
+/// prompt 并下载图片。单张失败只记录错误、继续下一张；全部失败才以非零码退出。
+async fn run_batch(plan_path: &PathBuf, args: &Args) -> Result<()> {
+    // 1. 解析并校验计划文件
+    let raw = std::fs::read_to_string(plan_path).map_err(|e| {
+        anyhow::anyhow!("无法读取批量计划文件 {}: {e}", plan_path.display())
+    })?;
+    let plan: BatchPlan = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!("批量计划文件 JSON 解析失败 {}: {e}", plan_path.display())
+    })?;
+    if plan.items.is_empty() {
+        anyhow::bail!("批量计划 items 为空: {}", plan_path.display());
+    }
+    for (i, item) in plan.items.iter().enumerate() {
+        if item.prompt.trim().is_empty() {
+            anyhow::bail!("批量计划第 {} 项 prompt 为空", i);
+        }
+        if item.output.as_os_str().is_empty() {
+            anyhow::bail!("批量计划第 {} 项 output 为空", i);
+        }
+    }
+
+    let quality = plan.quality.clone().unwrap_or_else(|| "original".to_string());
+    let ratio = plan.ratio.clone();
+    let no_watermark = plan.no_watermark;
+    let timeout_ms = args.timeout_ms.unwrap_or(180_000);
+    let headless = !args.ui;
+    let total = plan.items.len();
+
+    println!("--- 启动豆包批量生图客户端（同对话模式） ---");
+    println!(
+        "计划: {} 张图片, 质量: {quality}, 比例: {}, 去水印: {no_watermark}, 单张超时: {}ms",
+        total,
+        ratio.as_deref().unwrap_or("默认"),
+        timeout_ms
+    );
+
+    // 2. 初始化浏览器（无头失败时降级到 UI 模式，复用单图的降级逻辑）
+    let mut client = DoubaoClient::new()?;
+    match client.init(headless).await {
+        Ok(()) => {}
+        Err(e) if headless => {
+            println!("\n⚠️ 无头模式初始化失败: {e}");
+            client.close().await;
+            println!("=============================================");
+            println!("🔄 正在自动以 UI 模式重启...");
+            println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
+            println!("=============================================\n");
+            client = DoubaoClient::new()?;
+            client.init(false).await?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    // 3. 可选的上下文消息：纯文字，不等图片，等 AI 回复停止或 30s 超时后继续
+    if let Some(ctx) = plan
+        .context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        println!("\n===== 发送上下文消息（{} 字） =====", ctx.chars().count());
+        if let Err(e) = client.send_context_message(ctx, 30_000).await {
+            eprintln!("⚠️ 上下文消息发送/等待失败（继续批量生图）: {e}");
+        }
+    }
+
+    // 4. 逐条发送生图 prompt（同一对话），失败记录并继续
+    let mut results: Vec<BatchResultItem> = Vec::with_capacity(total);
+    for (i, item) in plan.items.iter().enumerate() {
+        println!("\n===== 批量生图 [{}/{}] =====", i + 1, total);
+        println!("Prompt: {}", item.prompt);
+        println!("Output: {}", item.output.display());
+
+        let result =
+            batch_generate_one(&mut client, item, &quality, ratio.as_deref(), timeout_ms, no_watermark)
+                .await;
+        if result.ok {
+            println!("✅ [{}/{}] 成功: {}", i + 1, total, item.output.display());
+        } else {
+            eprintln!(
+                "❌ [{}/{}] 失败: {} — {}",
+                i + 1,
+                total,
+                item.output.display(),
+                result.error.as_deref().unwrap_or("未知错误")
+            );
+        }
+        results.push(result);
+    }
+
+    client.close().await;
+
+    // 5. stdout 输出一行 JSON 摘要（供下游解析）；全部失败才非零退出
+    let ok_count = results.iter().filter(|r| r.ok).count();
+    println!("\n===== 批量生图完成: {ok_count}/{total} 成功 =====");
+    let summary = serde_json::json!({ "results": results });
+    println!("{}", serde_json::to_string(&summary)?);
+
+    if ok_count == 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// 执行单个批量 item：发送 prompt → 等图 → 下载 → 按需去水印。
+async fn batch_generate_one(
+    client: &mut DoubaoClient,
+    item: &BatchItem,
+    quality: &str,
+    ratio: Option<&str>,
+    timeout_ms: u64,
+    no_watermark: bool,
+) -> BatchResultItem {
+    let output_str = item.output.to_string_lossy().to_string();
+    let fail = |msg: String| BatchResultItem {
+        output: output_str.clone(),
+        ok: false,
+        error: Some(msg),
+    };
+
+    let image_info = match client
+        .generate_image(&item.prompt, quality, ratio, timeout_ms, &[])
+        .await
+    {
+        Ok(Some(info)) => info,
+        Ok(None) => return fail(format!("等待图片超时（{timeout_ms}ms）")),
+        Err(e) => return fail(format!("{e}")),
+    };
+    println!(
+        "图片链接: {} {}",
+        image_info.url,
+        if image_info.is_watermark_free {
+            "(无水印原图)"
+        } else {
+            ""
+        }
+    );
+
+    let saved = match client.download_with_page(&image_info.url, &item.output).await {
+        Ok(p) => p,
+        Err(e) => return fail(format!("下载失败: {e}")),
+    };
+
+    // 与单图模式一致：仅当 URL 不是 SSE 拦截到的无水印原图时才做本地裁切去水印
+    if no_watermark && !image_info.is_watermark_free {
+        match remove_watermark(&saved) {
+            Ok(()) => println!("🧹 水印已去除"),
+            Err(e) => eprintln!("⚠️ 水印去除失败: {e}"),
+        }
+    } else if no_watermark && image_info.is_watermark_free {
+        println!("🧹 已直接下载无水印原图，无需额外处理");
+    }
+
+    BatchResultItem {
+        output: output_str,
+        ok: true,
+        error: None,
+    }
 }
