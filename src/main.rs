@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "doubao-web-image")]
 #[command(about = "豆包 Web 端自动化生图工具 (Rust + chromiumoxide)")]
-#[command(version = "1.4.1")]
+#[command(version = "1.5.0")]
 struct Args {
     /// 生图提示词
     #[arg(value_name = "PROMPT")]
@@ -15,6 +15,10 @@ struct Args {
     /// 同对话批量生图模式：plan.json 计划文件路径（提供后忽略位置参数 PROMPT）
     #[arg(long, value_name = "PLAN_JSON")]
     batch: Option<PathBuf>,
+
+    /// 直出收图模式：plan.json 计划文件路径（整篇文案一条消息发出，按序收全部图）
+    #[arg(long, value_name = "PLAN_JSON")]
+    direct: Option<PathBuf>,
 
     /// 显示浏览器窗口（首次登录必须带此参数）
     #[arg(long)]
@@ -93,6 +97,11 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = Args::parse();
 
+    // 直出收图模式：--direct=plan.json 时忽略位置参数 PROMPT
+    if let Some(plan_path) = &args.direct {
+        return run_direct(plan_path, &args).await;
+    }
+
     // 同对话批量生图模式：--batch=plan.json 时忽略位置参数 PROMPT
     if let Some(plan_path) = &args.batch {
         return run_batch(plan_path, &args).await;
@@ -120,7 +129,8 @@ async fn run() -> Result<()> {
     --reference=<PATH>      参考图路径（可重复，最多 4 张；支持逗号分隔）
     --no-watermark          去除左上角水印（AI 生成标签）
     --batch=<PLAN_JSON>     同对话批量生图模式（plan.json 描述 context 与 items）
-    --timeout-ms=<MS>       每张图片的等待超时（单图默认 120000，批量默认 180000）
+    --direct=<PLAN_JSON>    直出收图模式（整篇文案一条消息发出，按序收全部图+文字回复）
+    --timeout-ms=<MS>       每张图片的等待超时（单图默认 120000，批量默认 180000，直出为总时长默认 1800000）
     -h, --help              显示帮助
     -V, --version           显示版本
 
@@ -571,4 +581,175 @@ async fn batch_generate_one(
         ok: true,
         error: None,
     }
+}
+
+// ==================== 直出收图模式（--direct） ====================
+
+/// 直出收图计划文件（plan.json）。
+#[derive(Debug, serde::Deserialize)]
+struct DirectPlan {
+    /// 完整消息文本（文案+全部要求），作为一条消息发送
+    message: String,
+
+    /// 输出目录（建议绝对路径）
+    #[serde(rename = "outputDir", alias = "output_dir")]
+    output_dir: PathBuf,
+
+    /// 最多收多少张图（默认 25）
+    #[serde(rename = "maxImages", alias = "max_images", default = "default_max_images")]
+    max_images: usize,
+
+    /// 最后一次活动（新图/新文字）后多少秒无进展结束（默认 90）
+    #[serde(
+        rename = "settleSeconds",
+        alias = "settle_seconds",
+        default = "default_settle_seconds"
+    )]
+    settle_seconds: u64,
+
+    /// 催更消息（默认「继续」；空字符串禁用催更）
+    #[serde(
+        rename = "continuePrompt",
+        alias = "continue_prompt",
+        default = "default_continue_prompt"
+    )]
+    continue_prompt: String,
+
+    /// 最多催更次数（默认 15）
+    #[serde(
+        rename = "maxContinues",
+        alias = "max_continues",
+        default = "default_max_continues"
+    )]
+    max_continues: u32,
+
+    /// 图片比例（如 9:16），以自然语言后缀拼到消息末尾
+    ratio: Option<String>,
+
+    /// 图片质量：preview 或 original，默认 original
+    quality: Option<String>,
+
+    /// 是否去除左上角水印（AI 生成标签）
+    #[serde(default, rename = "noWatermark", alias = "no_watermark")]
+    no_watermark: bool,
+}
+
+fn default_max_images() -> usize {
+    25
+}
+fn default_settle_seconds() -> u64 {
+    90
+}
+fn default_continue_prompt() -> String {
+    "继续".to_string()
+}
+fn default_max_continues() -> u32 {
+    15
+}
+
+/// 直出收图：新开一个豆包对话，把整篇文案+配图要求作为一条消息发出，
+/// 按序收下陆续生成的全部图片并抓取文字回复，结束时输出 JSON 摘要。
+async fn run_direct(plan_path: &PathBuf, args: &Args) -> Result<()> {
+    // 1. 解析并校验计划文件
+    let raw = std::fs::read_to_string(plan_path).map_err(|e| {
+        anyhow::anyhow!("无法读取直出计划文件 {}: {e}", plan_path.display())
+    })?;
+    let plan: DirectPlan = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!("直出计划文件 JSON 解析失败 {}: {e}", plan_path.display())
+    })?;
+    if plan.message.trim().is_empty() {
+        anyhow::bail!("直出计划 message 为空: {}", plan_path.display());
+    }
+    if plan.output_dir.as_os_str().is_empty() {
+        anyhow::bail!("直出计划 outputDir 为空: {}", plan_path.display());
+    }
+    if plan.max_images == 0 {
+        anyhow::bail!("直出计划 maxImages 必须大于 0: {}", plan_path.display());
+    }
+
+    let quality = plan.quality.clone().unwrap_or_else(|| "original".to_string());
+    // --timeout-ms 在直出模式下表示整个收图循环的最长总时长（默认 30 分钟）
+    let overall_timeout_ms = args.timeout_ms.unwrap_or(1_800_000);
+    let headless = !args.ui;
+
+    println!("--- 启动豆包直出收图客户端 ---");
+    println!(
+        "计划: 消息 {} 字, 上限 {} 张, 质量: {quality}, settle: {}s, 催更上限: {}, 总超时: {}ms",
+        plan.message.chars().count(),
+        plan.max_images,
+        plan.settle_seconds,
+        plan.max_continues,
+        overall_timeout_ms
+    );
+
+    // 2. 初始化浏览器（无头失败时降级到 UI 模式，复用现有降级逻辑）
+    let mut client = DoubaoClient::new()?;
+    match client.init(headless).await {
+        Ok(()) => {}
+        Err(e) if headless => {
+            println!("\n⚠️ 无头模式初始化失败: {e}");
+            client.close().await;
+            println!("=============================================");
+            println!("🔄 正在自动以 UI 模式重启...");
+            println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
+            println!("=============================================\n");
+            client = DoubaoClient::new()?;
+            if let Err(e) = client.init(false).await {
+                client.close().await;
+                return Err(e);
+            }
+        }
+        Err(e) => return Err(e),
+    }
+
+    // 3. 发送消息并进入收图循环（ratio 语义与单图一致：自然语言后缀拼接）
+    let message = match &plan.ratio {
+        Some(r) => format!("{}，图片比例 {r}", plan.message),
+        None => plan.message.clone(),
+    };
+    let collection = client
+        .run_direct_collection(
+            &message,
+            &plan.output_dir,
+            plan.max_images,
+            plan.settle_seconds,
+            &plan.continue_prompt,
+            plan.max_continues,
+            &quality,
+            overall_timeout_ms,
+        )
+        .await?;
+
+    client.close().await;
+
+    // 4. noWatermark 语义与现有模式一致：SSE 无水印原图无需处理，
+    //    其余（预览降级图）做本地放大裁切去水印
+    if plan.no_watermark {
+        for (path, is_watermark_free) in &collection.images {
+            if *is_watermark_free {
+                continue;
+            }
+            match remove_watermark(path) {
+                Ok(()) => println!("🧹 水印已去除: {}", path.display()),
+                Err(e) => eprintln!("⚠️ 水印去除失败 {}: {e}", path.display()),
+            }
+        }
+    }
+
+    // 5. stdout 最后一行输出 JSON 摘要；≥1 张图 exit 0，0 张 exit 1
+    let summary = serde_json::json!({
+        "images": collection
+            .images
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+        "replyText": collection.reply_text,
+        "continues": collection.continues,
+    });
+    println!("{}", serde_json::to_string(&summary)?);
+
+    if collection.images.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
 }

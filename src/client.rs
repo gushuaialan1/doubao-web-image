@@ -8,8 +8,8 @@ use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, NavigateParams,
 };
 use futures::StreamExt;
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs;
@@ -234,6 +234,18 @@ pub struct GeneratedImageInfo {
     pub url: String,
     /// 是否为通过 SSE 拦截到的无水印原图（`image_ori_raw`）。
     pub is_watermark_free: bool,
+}
+
+/// --direct 直出收图结果。
+#[derive(Debug)]
+pub struct DirectCollection {
+    /// 已保存的图片（按收到顺序）；bool 表示是否为 SSE 拦截的无水印原图
+    /// （false 的需要由调用方按需做本地去水印处理）。
+    pub images: Vec<(PathBuf, bool)>,
+    /// 累积抓取的 AI 文字回复（所有轮次拼接）。
+    pub reply_text: String,
+    /// 实际发送的催更次数。
+    pub continues: u32,
 }
 
 pub struct DoubaoClient {
@@ -1456,6 +1468,293 @@ impl DoubaoClient {
         }
 
         Ok(None)
+    }
+
+    /// 抓取当前对话中所有 AI 回复气泡的文字（按文档顺序拼接去重）。
+    /// 主选择器是豆包 markdown 渲染根的语义类 `md-box-root`（经探针核实；
+    /// 哈希类名 container-XXXX 会随部署变化，不作锚点），排除思维链盒子与
+    /// 用户发送气泡；老的选择器层叠作为兜底。单次 CDP 异常返回 None（跳过本轮）。
+    async fn collect_ai_reply_text(&self) -> Option<String> {
+        let page = self.page.as_ref()?;
+        let text: String = page
+            .evaluate(
+                r#"
+                (function() {
+                    const collect = (els, skipNestedSel) => {
+                        const seen = new Set();
+                        const out = [];
+                        for (const el of els) {
+                            // 跳过嵌套在已匹配元素内部的重复容器，避免文本重复
+                            if (skipNestedSel && el.parentElement && el.parentElement.closest(skipNestedSel)) continue;
+                            const t = (el.innerText || '').trim();
+                            if (!t || seen.has(t)) continue;
+                            seen.add(t);
+                            out.push(t);
+                        }
+                        return out;
+                    };
+                    // 主路径：AI 回复的 markdown 渲染根（排除思维链与用户发送气泡）
+                    const mdRoots = Array.from(document.querySelectorAll('div.md-box-root'))
+                        .filter(el => !el.closest('[class*="thinking-box"], [class*="send-msg-bubble"]'));
+                    const parts = collect(mdRoots, 'div.md-box-root');
+                    if (parts.length) return parts.join('\n');
+                    // 兜底：老选择器层叠
+                    for (const sel of [
+                        '[class*="markdown-body"]',
+                        '[class*="markdown"]',
+                        '[class*="receive-message"]',
+                        '[data-testid*="message"]'
+                    ]) {
+                        const fallback = collect(Array.from(document.querySelectorAll(sel)), sel);
+                        if (fallback.length) return fallback.join('\n');
+                    }
+                    return '';
+                })()
+            "#,
+            )
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())?;
+        Some(text)
+    }
+
+    /// --direct 直出收图：整篇消息发出后进入收图循环，把对话里陆续生成的图全部按序收下。
+    ///
+    /// 收图逻辑复用加固后的双通道件（DOM 新图 diff + SSE image_ori_raw 缓存）：
+    /// DOM diff 按出现顺序发现新图（以 imagex 对象 key 去重，模板替换不会重复计数）；
+    /// original 质量下与 SSE 无水印原图按到达顺序一一配对下载，preview 质量直接下 DOM 图。
+    /// 一轮回复结束（25s 无新图/新文字）且未达 max_images 时发送 continue_prompt 催更
+    /// （最多 max_continues 次）；最后一次活动后 settle_seconds 无进展、达到 max_images
+    /// 或超过 overall_timeout_ms 时结束。收尾时未配对的图按 DOM 预览降级下载并明确标注。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_direct_collection(
+        &mut self,
+        message: &str,
+        output_dir: &Path,
+        max_images: usize,
+        settle_seconds: u64,
+        continue_prompt: &str,
+        max_continues: u32,
+        quality: &str,
+        overall_timeout_ms: u64,
+    ) -> Result<DirectCollection> {
+        fs::create_dir_all(output_dir).await?;
+
+        // 发送前准备：补注入 SSE hook、Escape 清场、快照已有图片
+        self.ensure_stream_interceptor().await;
+        if let Some(page) = self.page.as_ref() {
+            let _ = page
+                .evaluate(
+                    r#"
+                    document.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true
+                    }));
+                    true
+                "#,
+                )
+                .await;
+        }
+        sleep(Duration::from_millis(500)).await;
+        let before_urls = self.current_image_urls().await.unwrap_or_default();
+        let before_ori_count = self.ori_raw_count().await.unwrap_or(0);
+        // 以 imagex 对象 key 去重（同一图的 downsize/qvalue 等模板变体共享 key）
+        let mut seen_keys: HashSet<String> = before_urls
+            .iter()
+            .map(|u| Self::extract_imagex_key(u))
+            .collect();
+        println!(
+            "[DoubaoClient-Debug] 直出发送前，已有图片数量: {}，无水印原图缓存: {before_ori_count}",
+            before_urls.len()
+        );
+
+        self.send_message(message, &[]).await?;
+        println!(
+            "[DoubaoClient] 直出消息已发送，进入收图循环（上限 {max_images} 张，settle {settle_seconds}s）..."
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(overall_timeout_ms);
+        let settle = Duration::from_secs(settle_seconds);
+        let round_idle = Duration::from_secs(25).min(settle);
+        let mut last_activity = Instant::now();
+        let mut continues = 0u32;
+        let mut images: Vec<(PathBuf, bool)> = Vec::new();
+        let mut pending: VecDeque<String> = VecDeque::new();
+        let mut next_ori = before_ori_count;
+        let mut reply_text = String::new();
+        let mut poll_count = 0u32;
+
+        loop {
+            sleep(Duration::from_millis(2000)).await;
+            poll_count += 1;
+            let now = Instant::now();
+            if now >= deadline {
+                println!(
+                    "[DoubaoClient] 达到总时长上限（{}s），结束收图",
+                    overall_timeout_ms / 1000
+                );
+                break;
+            }
+
+            // a. AI 文字回复：气泡在 DOM 中持久存在，取历史最长快照即为全部轮次拼接
+            if let Some(text) = self.collect_ai_reply_text().await {
+                if text.len() > reply_text.len() {
+                    reply_text = text;
+                    last_activity = now;
+                }
+            }
+
+            // b. DOM 新图（按对象 key 去重）入队，保持出现顺序
+            if let Ok(cur) = self.current_image_urls().await {
+                for u in cur {
+                    let key = Self::extract_imagex_key(&u);
+                    if !key.is_empty() && !seen_keys.contains(&key) {
+                        seen_keys.insert(key);
+                        pending.push_back(u);
+                        last_activity = now;
+                        println!(
+                            "[DoubaoClient] 发现新图（待收 {} 张）",
+                            pending.len()
+                        );
+                    }
+                }
+            }
+
+            // c. 收图：original 与 SSE 原图按序配对，preview 直接下 DOM 图
+            if quality == "preview" {
+                while let Some(u) = pending.pop_front() {
+                    if images.len() >= max_images {
+                        break;
+                    }
+                    let dest = output_dir.join(format!("img_{:02}.png", images.len()));
+                    match Self::download_image(&u, &dest).await {
+                        Ok(p) => {
+                            println!("[DoubaoClient] 已收第 {} 张（对话预览图）", images.len() + 1);
+                            images.push((p, false));
+                            last_activity = now;
+                        }
+                        Err(e) => eprintln!("⚠️ 图片下载失败（跳过）: {e}"),
+                    }
+                }
+            } else if let Ok(ori) = self.ori_raw_list().await {
+                while !pending.is_empty() && ori.len() > next_ori && images.len() < max_images {
+                    let item = ori[next_ori].clone();
+                    next_ori += 1;
+                    pending.pop_front();
+                    let dest = output_dir.join(format!("img_{:02}.png", images.len()));
+                    match Self::download_image(&item.url, &dest).await {
+                        Ok(p) => {
+                            println!(
+                                "[DoubaoClient] 已收第 {} 张（SSE 无水印原图 {}x{}）",
+                                images.len() + 1,
+                                item.width,
+                                item.height
+                            );
+                            images.push((p, true));
+                            last_activity = now;
+                        }
+                        Err(e) => eprintln!("⚠️ 图片下载失败（跳过）: {e}"),
+                    }
+                }
+            }
+
+            if images.len() >= max_images {
+                println!("[DoubaoClient] 已达 maxImages={max_images}，结束收图");
+                break;
+            }
+
+            // d. 空闲处理：先到轮次空闲阈值则催更，到 settle 则结束
+            let idle = now.duration_since(last_activity);
+            if idle >= settle {
+                println!("[DoubaoClient] {settle_seconds}s 无任何进展，判定收图结束");
+                break;
+            }
+            if idle >= round_idle
+                && continues < max_continues
+                && !continue_prompt.trim().is_empty()
+            {
+                println!(
+                    "[DoubaoClient] 一轮回复已结束（{}s 无进展），发送催更「{}」（第 {}/{max_continues} 次）",
+                    idle.as_secs(),
+                    continue_prompt,
+                    continues + 1
+                );
+                match self.send_message(continue_prompt, &[]).await {
+                    Ok(()) => {
+                        continues += 1;
+                        last_activity = Instant::now();
+                        // 人性化间隔：催更后缓一缓再恢复轮询
+                        sleep(Duration::from_millis(3000)).await;
+                    }
+                    Err(e) => eprintln!("⚠️ 催更发送失败: {e}"),
+                }
+            }
+
+            if poll_count % 10 == 0 {
+                println!(
+                    "[DoubaoClient-Debug] 收图中：已存 {} 张，待配对 {} 张，催更 {continues} 次",
+                    images.len(),
+                    pending.len()
+                );
+            }
+        }
+
+        // 收尾：original 质量下，先把 SSE 里尚未消费的原图收完（DOM 因虚拟列表
+        // 可能漏显），再对一直没等到原图的 pending 项降级下载对话预览。
+        if quality != "preview" {
+            if let Ok(ori) = self.ori_raw_list().await {
+                while ori.len() > next_ori && images.len() < max_images {
+                    let item = ori[next_ori].clone();
+                    next_ori += 1;
+                    pending.pop_front();
+                    let dest = output_dir.join(format!("img_{:02}.png", images.len()));
+                    match Self::download_image(&item.url, &dest).await {
+                        Ok(p) => {
+                            println!(
+                                "[DoubaoClient] 收尾补收第 {} 张（SSE 无水印原图）",
+                                images.len() + 1
+                            );
+                            images.push((p, true));
+                        }
+                        Err(e) => eprintln!("⚠️ 收尾下载失败（跳过）: {e}"),
+                    }
+                }
+            }
+        }
+        while let Some(u) = pending.pop_front() {
+            if images.len() >= max_images {
+                break;
+            }
+            println!(
+                "⚠️ 第 {} 张未等到无水印原图，降级下载对话内预览",
+                images.len() + 1
+            );
+            let dest = output_dir.join(format!("img_{:02}.png", images.len()));
+            match Self::download_image(&u, &dest).await {
+                Ok(p) => images.push((p, false)),
+                Err(e) => eprintln!("⚠️ 收尾下载失败（跳过）: {e}"),
+            }
+        }
+
+        println!(
+            "[DoubaoClient] 收图结束：共 {} 张，催更 {continues} 次，回复文字 {} 字",
+            images.len(),
+            reply_text.chars().count()
+        );
+        Ok(DirectCollection {
+            images,
+            reply_text,
+            continues,
+        })
+    }
+
+    /// 调试探针：在当前页面执行任意 JS 并返回 JSON 值（仅供 dom_probe 诊断用）。
+    #[doc(hidden)]
+    pub async fn debug_eval(&self, js: &str) -> Option<serde_json::Value> {
+        let page = self.page.as_ref()?;
+        page.evaluate(js)
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
     }
 
     async fn wait_for_element(

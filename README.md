@@ -17,6 +17,7 @@
 - 🖼️ **高清大图下载**：自动拦截原生下载链接，获取 >3MB 的无损高分辨率原图。
 - 📎 **参考图上传**：`--reference` 上传本地参考图（最多 4 张），生图时保持主体/商品外观一致。
 - 📚 **同对话批量生图**：`--batch=plan.json` 在一个对话里先发全文文案、再连续发多条配图要求，人物/风格一致性更好。
+- 📥 **直出收图**：`--direct=plan.json` 把整篇文案一条消息发出，按序收下陆续生成的全部图片并抓取文字回复，支持「继续」自动催更。
 - 📏 **比例控制**：支持通过自然语言参数控制图片长宽比（如 `16:9`, `1:1`）。
 - 🛡️ **验证码自动降级**：默认无头模式运行，遇到风控拦截时自动弹窗切换到 UI 模式。
 - ⚡ **单文件分发**：编译后单个 exe，无需 Node.js、无需 npm install、无需单独下载浏览器。
@@ -87,6 +88,7 @@ doubao-web-image.exe "一只带有未来科技感的机器狗"
 | `--no-watermark` | 去除左上角「AI 生成」水印 | `--no-watermark` |
 | `--reference` | 参考图路径（可重复，最多 4 张，支持逗号分隔） | `--reference=./cover.png` |
 | `--batch` | 同对话批量生图模式（plan.json 路径） | `--batch=plan.json` |
+| `--direct` | 直出收图模式（plan.json 路径） | `--direct=plan.json` |
 | `--timeout-ms` | 每张图片的等待超时（毫秒；单图默认 120000，批量默认 180000） | `--timeout-ms=180000` |
 
 支持的图片比例：`1:1`, `2:3`, `3:4`, `4:3`, `9:16`, `16:9`
@@ -129,6 +131,44 @@ doubao-web-image.exe --batch=plan.json --timeout-ms=180000
 
 - 进程退出码：**全部失败才非零**（至少一张成功即退出码 0）。plan.json 解析失败或 items 为空时非零。
 - `--ui`（无头初始化失败时也会自动降级到 UI 模式）、`--timeout-ms`（每张图超时，默认 180s）同样可用。
+
+### 直出收图（--direct，一条消息出全部图）
+
+「豆包直出」模式：把整篇文案+配图要求作为**一条消息**发给豆包，豆包在同一对话里连续出很多张图（可能分多轮回复），CLI 按出现顺序全部收下，并抓取 AI 的文字回复（内含每张图对应的文案起点/终点标识）。
+
+```bash
+doubao-web-image.exe --direct=plan.json
+```
+
+`plan.json` 格式（除 `message`/`outputDir` 外均可选）：
+
+```json
+{
+  "message": "完整消息文本（文案+全部要求）",
+  "outputDir": "E:/output/story1",
+  "maxImages": 25,
+  "settleSeconds": 90,
+  "continuePrompt": "继续",
+  "maxContinues": 15,
+  "ratio": "9:16",
+  "quality": "original",
+  "noWatermark": true
+}
+```
+
+行为说明：
+
+- 新开一个对话发送 `message`（`ratio` 会按现有语义拼成「，图片比例 X」后缀），随后进入收图循环：对话里**每出现一张新图就按序收下**，命名 `img_00.png, img_01.png ...` 存入 `outputDir`。一轮出 4 宫格候选时按出现顺序全收。
+- original 质量优先使用 SSE 拦截的无水印原图（按到达顺序与 DOM 新图配对）；`noWatermark`、下载重试等语义与单图/--batch 一致。
+- 一轮回复结束（25s 无新图/新文字）且未达 `maxImages` 时自动发送 `continuePrompt` 催更（最多 `maxContinues` 次，设为空字符串可禁用）。
+- 结束条件：达到 `maxImages`，或最后一次活动后 `settleSeconds` 内无任何进展。`--timeout-ms` 在此模式下为整个收图循环的最长总时长（默认 1800000ms）。
+- 结束时 stdout 最后一行输出 JSON 摘要（`replyText` 为所有轮次 AI 文字回复的拼接）：
+
+```json
+{"continues":2,"images":["E:/output/story1/img_00.png","E:/output/story1/img_01.png"],"replyText":"..."}
+```
+
+- 退出码：≥1 张图 exit 0，0 张 exit 1。plan.json 解析失败/字段缺失时非零。
 
 ### 参考图（保持主体外观一致）
 
