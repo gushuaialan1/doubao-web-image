@@ -120,6 +120,7 @@ doubao-web-image.exe --batch=plan.json --timeout-ms=180000
 - context 消息只等待 AI 回复停止（最长 30s），**不等待图片**。
 - 逐条发送 item 的 prompt，等待并下载图片到各自 `output` 路径（ratio/quality/noWatermark 逻辑与单图模式一致）。
 - **单张失败（超时/风控）只记录错误并继续下一张**，不整体中断。
+- 取图健壮性：SSE 无水印原图拦截与 DOM 图片检测双通道竞速，一路失效自动切另一路；响应体读取竞态失败时保留 URL 回退 reqwest 下载（下载本身也有 3 次重试）；单张取图失败会在同一对话自动补发一次「重新生成」。
 - 全部完成后 stdout 输出一行 JSON 摘要，供调用方解析：
 
 ```json

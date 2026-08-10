@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "doubao-web-image")]
 #[command(about = "豆包 Web 端自动化生图工具 (Rust + chromiumoxide)")]
-#[command(version = "1.4.0")]
+#[command(version = "1.4.1")]
 struct Args {
     /// 生图提示词
     #[arg(value_name = "PROMPT")]
@@ -314,10 +314,27 @@ async fn try_generate(
         }
     );
 
-    let image_info = client
+    let image_info = match client
         .generate_image(prompt, quality, ratio, timeout_ms, references)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("未能获取图片 URL"))?;
+        .await
+    {
+        Ok(Some(info)) => info,
+        // 首轮取图失败（超时/取 URL 失败）：在同一对话里补发一次「重新生成」再取
+        Ok(None) => {
+            println!("\n⚠️ 首轮未等到图片，在同一对话补发一次重新生成...");
+            client
+                .regenerate_and_wait(quality, timeout_ms)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("未能获取图片 URL"))?
+        }
+        Err(e) => {
+            println!("\n⚠️ 首轮取图出错: {e}，在同一对话补发一次重新生成...");
+            match client.regenerate_and_wait(quality, timeout_ms).await {
+                Ok(Some(info)) => info,
+                _ => return Err(e),
+            }
+        }
+    };
 
     println!("\n✅ 成功!");
     println!(
@@ -423,7 +440,11 @@ async fn run_batch(plan_path: &PathBuf, args: &Args) -> Result<()> {
             println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
             println!("=============================================\n");
             client = DoubaoClient::new()?;
-            client.init(false).await?;
+            if let Err(e) = client.init(false).await {
+                // init 失败也要关闭已启动的浏览器进程，避免残留
+                client.close().await;
+                return Err(e);
+            }
         }
         Err(e) => return Err(e),
     }
@@ -500,8 +521,25 @@ async fn batch_generate_one(
         .await
     {
         Ok(Some(info)) => info,
-        Ok(None) => return fail(format!("等待图片超时（{timeout_ms}ms）")),
-        Err(e) => return fail(format!("{e}")),
+        // 首轮取图失败（超时/取 URL 失败）：在同一对话里补发一次「重新生成」再取
+        Ok(None) => {
+            println!("⚠️ 首轮未等到图片，在同一对话补发一次重新生成...");
+            match client.regenerate_and_wait(quality, timeout_ms).await {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    return fail(format!("等待图片超时（{timeout_ms}ms，含一次补发重试）"));
+                }
+                Err(e) => return fail(format!("补发重试失败: {e}")),
+            }
+        }
+        Err(e) => {
+            println!("⚠️ 首轮取图出错: {e}，在同一对话补发一次重新生成...");
+            match client.regenerate_and_wait(quality, timeout_ms).await {
+                Ok(Some(info)) => info,
+                Ok(None) => return fail(format!("{e}；补发后仍未等到图片")),
+                Err(e2) => return fail(format!("{e}；补发重试失败: {e2}")),
+            }
+        }
     };
     println!(
         "图片链接: {} {}",

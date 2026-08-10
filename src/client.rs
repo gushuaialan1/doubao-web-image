@@ -241,6 +241,9 @@ pub struct DoubaoClient {
     page: Option<Arc<Page>>,
     user_data_dir: PathBuf,
     intercepted_buffers: HashMap<String, Vec<u8>>,
+    /// 本轮回合中拦截到的所有图片响应 URL（无论响应体是否成功读取）。
+    /// GetResponseBody 存在竞态（-32000 No data found），体丢了 URL 仍可走 reqwest 回退下载。
+    intercepted_urls: Vec<String>,
 }
 
 impl DoubaoClient {
@@ -257,6 +260,7 @@ impl DoubaoClient {
             page: None,
             user_data_dir,
             intercepted_buffers: HashMap::new(),
+            intercepted_urls: Vec::new(),
         })
     }
 
@@ -278,7 +282,31 @@ impl DoubaoClient {
         }
         let config = config_builder.build().map_err(|e| anyhow!("{e}"))?;
 
-        let (browser, mut handler) = Browser::launch(config).await?;
+        // 浏览器启动加超时 + 明确错误：同一 session profile 被另一个 CLI 实例占用
+        // （或有残留 chrome 进程）时，launch 可能挂起或 chrome 启动即退出
+        // （exit status 21），给出可操作的提示而不是干等/裸错误。
+        let launch_result =
+            tokio::time::timeout(Duration::from_secs(45), Browser::launch(config)).await;
+        let (browser, mut handler) = match launch_result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                let hint = if self.user_data_dir.join("DevToolsActivePort").exists() {
+                    format!(
+                        "检测到 {} 下存在 DevToolsActivePort，很可能有残留 chrome 进程仍占用该 session profile；请结束命令行包含 .doubao-web-session 的 chrome.exe 后重试。",
+                        self.user_data_dir.display()
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(anyhow!("浏览器启动失败: {e}。{hint}"));
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "浏览器启动超时（45s）。session 目录 {} 可能被另一个 doubao-web-image 实例占用，或存在残留的 chrome 进程；请关闭后重试。",
+                    self.user_data_dir.display()
+                ));
+            }
+        };
 
         // Spawn browser event handler
         tokio::spawn(async move {
@@ -289,39 +317,15 @@ impl DoubaoClient {
             }
         });
 
-        // Create blank page first, apply stealth, then navigate to target
-        let page = Arc::new(browser.new_page("about:blank").await?);
-
-        // Enable chromiumoxide built-in stealth + custom UA
-        page.enable_stealth_mode_with_agent(stealth::USER_AGENT)
-            .await?;
-
-        // Register supplemental stealth script for all future documents/iframes
-        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
-            stealth::STEALTH_SCRIPT,
-        ))
-        .await?;
-
-        // Also inject into current blank page immediately
-        let _ = page.evaluate(stealth::STEALTH_SCRIPT).await?;
-
-        // Inject EventStream interceptor to capture watermark-free image_ori_raw URLs
-        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
-            STREAM_INTERCEPTOR_SCRIPT,
-        ))
-        .await?;
-        let _ = page.evaluate(STREAM_INTERCEPTOR_SCRIPT).await?;
-
-        // Navigate to Doubao
-        page.goto(NavigateParams::new("https://www.doubao.com/chat/"))
-            .await?;
-        page.wait_for_navigation().await?;
-        sleep(Duration::from_millis(3000)).await;
-
-        let url: String = page.evaluate("window.location.href").await?.into_value()?;
-        let title: String = page.evaluate("document.title").await?.into_value()?;
-        println!("[DoubaoClient-Debug] URL: {url}");
-        println!("[DoubaoClient-Debug] Title: {title}");
+        // launch 成功后的任何失败都要先关闭浏览器进程再返回，避免残留进程占用 profile
+        let (page, url) = match Self::prepare_page(&browser).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let mut browser = browser;
+                let _ = browser.close().await;
+                return Err(e);
+            }
+        };
 
         self.browser = Some(browser);
         self.page = Some(Arc::clone(&page));
@@ -362,6 +366,46 @@ impl DoubaoClient {
         Ok(())
     }
 
+    /// 创建页面、注入 stealth / SSE 拦截脚本并导航到豆包首页。
+    /// 从 init 拆出：调用方在本函数失败时先关闭浏览器进程再返回错误，避免残留。
+    async fn prepare_page(browser: &Browser) -> Result<(Arc<Page>, String)> {
+        // Create blank page first, apply stealth, then navigate to target
+        let page = Arc::new(browser.new_page("about:blank").await?);
+
+        // Enable chromiumoxide built-in stealth + custom UA
+        page.enable_stealth_mode_with_agent(stealth::USER_AGENT)
+            .await?;
+
+        // Register supplemental stealth script for all future documents/iframes
+        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
+            stealth::STEALTH_SCRIPT,
+        ))
+        .await?;
+
+        // Also inject into current blank page immediately
+        let _ = page.evaluate(stealth::STEALTH_SCRIPT).await?;
+
+        // Inject EventStream interceptor to capture watermark-free image_ori_raw URLs
+        page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
+            STREAM_INTERCEPTOR_SCRIPT,
+        ))
+        .await?;
+        let _ = page.evaluate(STREAM_INTERCEPTOR_SCRIPT).await?;
+
+        // Navigate to Doubao
+        page.goto(NavigateParams::new("https://www.doubao.com/chat/"))
+            .await?;
+        page.wait_for_navigation().await?;
+        sleep(Duration::from_millis(3000)).await;
+
+        let url: String = page.evaluate("window.location.href").await?.into_value()?;
+        let title: String = page.evaluate("document.title").await?.into_value()?;
+        println!("[DoubaoClient-Debug] URL: {url}");
+        println!("[DoubaoClient-Debug] Title: {title}");
+
+        Ok((page, url))
+    }
+
     /// 单图模式入口：发送生图 prompt 并等待新图，返回最优图片 URL。
     ///
     /// 内部拆为「发送前快照 → send_message → wait_for_new_image」三步，
@@ -381,11 +425,66 @@ impl DoubaoClient {
 
         println!("[DoubaoClient] 发送生图请求: {final_prompt} (质量: {quality})");
 
+        self.generate_with_message(
+            &format!("帮我生成图片：{final_prompt}"),
+            references,
+            quality,
+            timeout_ms,
+        )
+        .await
+    }
+
+    /// 首轮取图失败后的补救：在同一对话里补发一条「按刚才的要求重新生成」，
+    /// 再按与首轮完全相同的逻辑等一次新图。单图/批量模式共用。
+    pub async fn regenerate_and_wait(
+        &mut self,
+        quality: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<GeneratedImageInfo>> {
+        println!("[DoubaoClient] 在同一对话补发「重新生成」请求...");
+        self.generate_with_message(
+            "按刚才的要求重新生成一张，保持同样的内容、风格和比例",
+            &[],
+            quality,
+            timeout_ms,
+        )
+        .await
+    }
+
+    /// 发送一条生图消息并等待新图（generate_image / regenerate_and_wait 的共用实现）。
+    async fn generate_with_message(
+        &mut self,
+        fill_text: &str,
+        references: &[PathBuf],
+        quality: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<GeneratedImageInfo>> {
         // Clear previous intercepts
         self.intercepted_buffers.clear();
+        self.intercepted_urls.clear();
 
         // Start network interception (captures original image responses for this turn)
         let mut intercept_task = self.spawn_response_interceptor()?;
+
+        // 保险：SPA 整页导航后 init 时注入的 SSE hook 会随文档销毁而丢失，
+        // 发送前补注入一次（脚本内部有幂等 guard，重复执行无副作用）。
+        self.ensure_stream_interceptor().await;
+
+        // 清场：关闭上一轮可能残留的大图 viewer/弹层，避免遮挡输入区或劫持焦点
+        // （补发重试、批量连续发图时尤其重要）。
+        if let Some(page) = self.page.as_ref() {
+            let _ = page
+                .evaluate(
+                    r#"
+                    document.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true
+                    }));
+                    true
+                "#,
+                )
+                .await;
+        }
+        sleep(Duration::from_millis(500)).await;
 
         // Collect existing image URLs / SSE cache count BEFORE sending so the wait
         // logic can diff against what appears afterwards. Works in a shared
@@ -402,8 +501,7 @@ impl DoubaoClient {
         );
 
         // Upload references (if any), fill textarea and press Enter
-        self.send_message(&format!("帮我生成图片：{final_prompt}"), references)
-            .await?;
+        self.send_message(fill_text, references).await?;
         println!("[DoubaoClient] 已发送指令，等待图片生成...");
 
         self.wait_for_new_image(
@@ -414,6 +512,13 @@ impl DoubaoClient {
             timeout_ms,
         )
         .await
+    }
+
+    /// 确保 SSE 拦截脚本已注入当前文档（脚本内部有幂等 guard）。
+    async fn ensure_stream_interceptor(&self) {
+        if let Some(page) = self.page.as_ref() {
+            let _ = page.evaluate(STREAM_INTERCEPTOR_SCRIPT).await;
+        }
     }
 
     /// 在当前对话中发送一条消息（可选先上传参考图），立即返回，不等待任何回复。
@@ -431,9 +536,29 @@ impl DoubaoClient {
             self.upload_references(references).await?;
         }
 
-        // Find and fill textarea (acquire after upload: React may re-render the input area)
-        let textarea = self.wait_for_element("textarea", 10000).await?;
-        textarea.click().await?;
+        // Find and fill textarea (acquire after upload: React may re-render the input area).
+        // 优先用 JS focus/click（对 viewer 残留遮盖、React 重渲染导致的元素句柄失效
+        // 免疫——Element::click 在元素无可见区域时会报 No value found），失败再退回元素点击。
+        let focused: bool = page
+            .evaluate(
+                r#"
+                (function() {
+                    const ta = document.querySelector('textarea');
+                    if (!ta) return false;
+                    ta.focus();
+                    ta.click();
+                    return true;
+                })()
+            "#,
+            )
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or(false);
+        if !focused {
+            let textarea = self.wait_for_element("textarea", 10000).await?;
+            textarea.click().await?;
+        }
         sleep(Duration::from_millis(200)).await;
 
         // Insert text via CDP Input.insertText (triggers React onChange, send button appears)
@@ -568,10 +693,14 @@ impl DoubaoClient {
     /// 启动网络响应拦截任务：捕获本轮回合中 flow-imagex-sign / image_pre_watermark
     /// 的响应体，供 download_with_page 直接使用内存数据保存原图。
     ///
+    /// 返回 (URL→响应体, 全部匹配 URL 列表)。GetResponseBody 存在竞态
+    /// （Error -32000 No data found，响应体被页面消费/回收），读体失败时 URL
+    /// 仍保留在列表里，供模态框提取失败时走 reqwest 回退下载。
     /// 返回的 JoinHandle 由调用方在等待结束后收集并 abort，避免批量模式下任务堆积。
+    #[allow(clippy::type_complexity)]
     fn spawn_response_interceptor(
         &self,
-    ) -> Result<tokio::task::JoinHandle<HashMap<String, Vec<u8>>>> {
+    ) -> Result<tokio::task::JoinHandle<(HashMap<String, Vec<u8>>, Vec<String>)>> {
         let page = self
             .page
             .as_ref()
@@ -582,14 +711,19 @@ impl DoubaoClient {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("[DoubaoClient] Failed to attach event listener: {e}");
-                    return HashMap::<String, Vec<u8>>::new();
+                    return (HashMap::<String, Vec<u8>>::new(), Vec::new());
                 }
             };
 
             let mut buffers = HashMap::new();
+            let mut urls: Vec<String> = Vec::new();
             while let Some(event) = events.next().await {
                 let url = &event.response.url;
                 if url.contains("flow-imagex-sign") || url.contains("image_pre_watermark") {
+                    // 无论响应体能否读到，都先记录 URL（读体竞态失败时的回退下载来源）
+                    if !urls.contains(url) {
+                        urls.push(url.clone());
+                    }
                     match page_arc
                         .execute(GetResponseBodyParams::new(event.request_id.clone()))
                         .await
@@ -610,12 +744,14 @@ impl DoubaoClient {
                             buffers.insert(url.clone(), data);
                         }
                         Err(e) => {
-                            eprintln!("[DoubaoClient] Failed to get response body: {e}");
+                            eprintln!(
+                                "[DoubaoClient] Failed to get response body: {e}（已保留 URL 供回退下载）"
+                            );
                         }
                     }
                 }
             }
-            buffers
+            (buffers, urls)
         }))
     }
 
@@ -624,9 +760,15 @@ impl DoubaoClient {
     /// before_urls / before_ori_count 由调用方在发送消息前快照，同一对话里已有的
     /// 旧图不会被误判为新图（批量模式的关键）。如果豆包一次回复多张候选图，
     /// 沿用既有策略取最新（最后）一张。
+    ///
+    /// 取图为双通道竞速：SSE 拦截的 image_ori_raw 无水印原图（优先）与 DOM 新图
+    /// diff 每轮都查，哪一路先出结果就走哪一路——豆包有时不走页面 fetch/XHR 发起
+    /// /chat/completion（疑似 Web Worker 或灰度传输），SSE 通道会整体失效，此时
+    /// DOM 通道必须能立即接管，而不是等满 SSE 超时才回退。轮询中的单次 CDP 调用
+    /// 失败（页面卡顿导致的 Request timed out）只跳过本轮，不再直接判死。
     async fn wait_for_new_image(
         &mut self,
-        intercept_task: &mut tokio::task::JoinHandle<HashMap<String, Vec<u8>>>,
+        intercept_task: &mut tokio::task::JoinHandle<(HashMap<String, Vec<u8>>, Vec<String>)>,
         before_urls: &[String],
         before_ori_count: usize,
         quality: &str,
@@ -638,59 +780,79 @@ impl DoubaoClient {
                 .ok_or_else(|| anyhow!("Not initialized"))?,
         );
 
-        // Enforce the overall timeout across both SSE interception and DOM polling.
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-
-        // Try to get watermark-free original URL from intercepted EventStream first.
-        // This mirrors the approach used by doubao-nomark: parse /chat/completion SSE
-        // and read creation.image.image_ori_raw.
-        if quality != "preview" {
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as u64;
-            let ori_timeout = remaining.saturating_sub(20_000).max(30_000);
-            if let Some(item) = self.poll_new_ori_raw(before_ori_count, ori_timeout).await? {
-                println!("[DoubaoClient] 已获取无水印原图 URL，跳过模态框提取");
-                intercept_task.abort();
-                return Ok(Some(GeneratedImageInfo {
-                    url: item.url,
-                    is_watermark_free: true,
-                }));
-            }
-            println!("[DoubaoClient] SSE 未拦截到无水印原图，回退到 DOM 提取");
-        }
-
-        // Poll for NEW images (by URL diff, not just count)
-        let mut target_url: Option<String> = None;
         let mut poll_count = 0;
+        let mut target_url: Option<String> = None;
 
         while Instant::now() < deadline {
-            sleep(Duration::from_millis(2000)).await;
+            sleep(Duration::from_millis(1500)).await;
             poll_count += 1;
 
-            let current_urls = self.current_image_urls().await?;
-            println!(
-                "[DoubaoClient-Debug] 第 {poll_count} 次轮询, 当前图片数量: {}",
-                current_urls.len()
-            );
+            // 通道 1：SSE 拦截的 image_ori_raw 无水印原图（优先，可跳过模态框提取）
+            if quality != "preview" {
+                match self.ori_raw_list().await {
+                    Ok(items) if items.len() > before_ori_count => {
+                        let item = items.last().unwrap();
+                        println!(
+                            "[DoubaoClient] SSE 拦截到无水印原图 ({}x{}): {}...",
+                            item.width,
+                            item.height,
+                            &item.url[..item.url.len().min(60)]
+                        );
+                        intercept_task.abort();
+                        return Ok(Some(GeneratedImageInfo {
+                            url: item.url.clone(),
+                            is_watermark_free: true,
+                        }));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("[DoubaoClient-Debug] 轮询 SSE 缓存失败（跳过本轮）: {e}")
+                    }
+                }
+            }
 
-            // Find URLs that appeared after we sent the message
-            let new_urls: Vec<String> = current_urls
-                .iter()
-                .filter(|url| !before_urls.contains(url))
-                .cloned()
-                .collect();
+            // 通道 2：DOM 新图 diff（by URL diff, not just count）
+            match self.current_image_urls().await {
+                Ok(current_urls) => {
+                    if poll_count % 4 == 0 {
+                        println!(
+                            "[DoubaoClient-Debug] 第 {poll_count} 次轮询, 当前图片数量: {}",
+                            current_urls.len()
+                        );
+                    }
+                    let new_urls: Vec<String> = current_urls
+                        .iter()
+                        .filter(|url| !before_urls.contains(url))
+                        .cloned()
+                        .collect();
+                    if !new_urls.is_empty() {
+                        // Take the last new URL (most likely the newest generated image)
+                        target_url = Some(new_urls.last().unwrap().clone());
+                        println!(
+                            "[DoubaoClient] 检测到新图片生成 (新增 {} 张)",
+                            new_urls.len()
+                        );
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[DoubaoClient-Debug] 轮询 DOM 图片失败（跳过本轮）: {e}")
+                }
+            }
 
-            if !new_urls.is_empty() {
-                // Take the last new URL (most likely the newest generated image)
-                let newest = new_urls.last().unwrap().clone();
-                sleep(Duration::from_millis(3000)).await;
-                target_url = Some(newest);
+            // 周期性输出 SSE 拦截器状态，便于诊断「SSE 通道整体失效」类问题
+            if poll_count % 8 == 0 && quality != "preview" {
+                let cache = self.ori_raw_count().await.unwrap_or(0);
+                let debug: InterceptorDebug = page
+                    .evaluate("window.__doubaoInterceptorDebug || {}")
+                    .await
+                    .ok()
+                    .and_then(|v| v.into_value().ok())
+                    .unwrap_or_default();
                 println!(
-                    "[DoubaoClient] 检测到新图片生成 (新增 {} 张)",
-                    new_urls.len()
+                    "[DoubaoClient-Debug] 等待新图，SSE 缓存: {cache}，拦截器状态: {debug:?}"
                 );
-                break;
             }
         }
 
@@ -702,6 +864,22 @@ impl DoubaoClient {
                 return Ok(None);
             }
         };
+
+        // 等缩略图加载稳定（与原实现一致的 3s 停顿）
+        sleep(Duration::from_millis(3000)).await;
+
+        // DOM 先出图：ori_raw 通常紧随其后，给 SSE 一个 8s 短宽限，
+        // 拿到无水印原图就免走模态框；拿不到再进模态框提取。
+        if quality != "preview" {
+            if let Ok(Some(item)) = self.poll_new_ori_raw(before_ori_count, 8_000).await {
+                println!("[DoubaoClient] 宽限期内 SSE 拦截到无水印原图，跳过模态框提取");
+                intercept_task.abort();
+                return Ok(Some(GeneratedImageInfo {
+                    url: item.url,
+                    is_watermark_free: true,
+                }));
+            }
+        }
 
         // If preview only, return immediately
         if quality == "preview" {
@@ -715,28 +893,66 @@ impl DoubaoClient {
         // === Get original image ===
         println!("[DoubaoClient] 正在尝试获取原始大图...");
 
-        // 1. Click thumbnail to open modal
+        // 0. 点击前重新 diff 一次拿到最新目标缩略图（生成过程中占位图/预览可能被
+        //    React 替换，早先捕获的 src 已变化），并提取 imagex 对象 key 用于稳定匹配。
+        let mut target_url = target_url;
+        if let Ok(current_urls) = self.current_image_urls().await {
+            let new_urls: Vec<String> = current_urls
+                .iter()
+                .filter(|url| !before_urls.contains(url))
+                .cloned()
+                .collect();
+            if let Some(newest) = new_urls.last() {
+                target_url = newest.clone();
+            }
+        }
+        let target_key = Self::extract_imagex_key(&target_url);
+        println!(
+            "[DoubaoClient-Debug] 目标缩略图: {}...（key: {target_key}）",
+            &target_url[..target_url.len().min(60)]
+        );
+
+        // 1. Click thumbnail to open modal（按对象 key 匹配点击目标。
+        //    旧实现用 URL 前 30 字符匹配，那只是 CDN 主机名前缀，host 不同就
+        //    静默点空、模态框根本没打开，最后退化成下载内联小预览图。）
         let click_script = format!(
             r#"
             (function() {{
+                const key = '{}';
                 const imgs = document.querySelectorAll('img[src*="flow-imagex-sign"]');
-                for (let i = imgs.length - 1; i >= 0; i--) {{
-                    if (imgs[i].getAttribute('src').includes('{}')) {{
-                        imgs[i].click();
-                        return true;
+                if (key) {{
+                    for (let i = imgs.length - 1; i >= 0; i--) {{
+                        const src = imgs[i].getAttribute('src') || '';
+                        if (src.includes(key)) {{
+                            imgs[i].click();
+                            return 'key';
+                        }}
                     }}
                 }}
-                return false;
+                if (imgs.length) {{
+                    imgs[imgs.length - 1].click();
+                    return 'last';
+                }}
+                return '';
             }})()
             "#,
-            &target_url[..target_url.len().min(30)]
+            target_key
         );
-        page.evaluate(click_script.as_str()).await?;
-        sleep(Duration::from_millis(3000)).await;
-        println!("[DoubaoClient] 已打开大图模态框");
+        let click_way: String = page
+            .evaluate(click_script.as_str())
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or_default();
+        println!("[DoubaoClient-Debug] 模态框点击方式: {}", if click_way.is_empty() { "未命中".to_string() } else { click_way });
 
-        // 2. Click save button
-        let clicked = self.click_save_button().await?;
+        // 等大图加载。当前豆包大图 URL 已无 image_pre_watermark 之类的固定标记，
+        // 无法再从 DOM 判定模态框是否打开；点击后大图请求必然产生大响应体
+        // （内联预览均 <100KB），后续靠网络拦截的大响应体识别。
+        sleep(Duration::from_millis(3000)).await;
+
+        // 2. Click save button（触发原图请求，供网络拦截捕获响应体；失败不判死）
+        let clicked = self.click_save_button().await.unwrap_or(false);
         if clicked {
             println!("[DoubaoClient] 已点击保存按钮");
         } else {
@@ -745,38 +961,50 @@ impl DoubaoClient {
 
         sleep(Duration::from_millis(2000)).await;
 
-        // 3. Extract original URL from DOM
-        let best_url: Option<String> = page
-            .evaluate(r#"
-                (function() {
-                    const imgs = document.querySelectorAll('img[src*="flow-imagex-sign"]');
-                    for (const img of imgs) {
+        // 3. Extract original URL from DOM（pre_watermark 大图优先——老版豆包标记；
+        //    其次只接受与目标同对象 key 的非压缩图，避免抓到内联小预览/侧栏缩略图。
+        //    单次 CDP 异常不判死，按未提取到处理）
+        let extract_script = format!(
+            r#"
+            (function() {{
+                const key = '{}';
+                const imgs = Array.from(document.querySelectorAll('img[src*="flow-imagex-sign"]'));
+                for (const img of imgs) {{
+                    const src = img.getAttribute('src');
+                    if (src && src.includes('image_pre_watermark')) {{
+                        return src;
+                    }}
+                }}
+                if (key) {{
+                    for (const img of imgs) {{
                         const src = img.getAttribute('src');
-                        if (src && src.includes('image_pre_watermark')) {
+                        if (src && src.includes(key) && !src.includes('downsize') && !src.includes('web-operation') && !src.includes('avatar')) {{
                             return src;
-                        }
-                    }
-                    for (const img of imgs) {
-                        const src = img.getAttribute('src');
-                        if (src && !src.includes('downsize') && !src.includes('web-operation') && !src.includes('avatar')) {
-                            return src;
-                        }
-                    }
-                    return null;
-                })()
-            "#)
-            .await?
-            .into_value()?;
+                        }}
+                    }}
+                }}
+                return null;
+            }})()
+            "#,
+            target_key
+        );
+        let dom_best_url: Option<String> = page
+            .evaluate(extract_script.as_str())
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .flatten();
 
-        // 4. Collect intercepted buffers, then stop the interceptor for this turn
+        // 4. Collect intercepted buffers + URL list, then stop the interceptor for this turn
         sleep(Duration::from_millis(1000)).await;
-        let intercepted =
+        let (intercepted, intercepted_urls) =
             match tokio::time::timeout(Duration::from_secs(2), &mut *intercept_task).await {
-                Ok(Ok(bufs)) => bufs,
-                _ => HashMap::new(),
+                Ok(Ok(pair)) => pair,
+                _ => (HashMap::new(), Vec::new()),
             };
         intercept_task.abort();
         self.intercepted_buffers = intercepted;
+        self.intercepted_urls = intercepted_urls;
 
         if !self.intercepted_buffers.is_empty() {
             let (first_url, first_buf) = self.intercepted_buffers.iter().next().unwrap();
@@ -787,17 +1015,73 @@ impl DoubaoClient {
             );
         }
 
-        // 5. Close modal
-        page.evaluate(
-            r#"
+        // 5. Close modal（结果忽略，页面异常不判死）
+        let _ = page
+            .evaluate(
+                r#"
             document.dispatchEvent(new KeyboardEvent('keydown', {
                 key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true
             }));
             true
         "#,
-        )
-        .await?;
+            )
+            .await;
         sleep(Duration::from_millis(500)).await;
+
+        // 末轮复查 SSE 缓存：生成完成较晚时 ori_raw 可能在模态框阶段才到达
+        // （实测宽限期结束后、模态框点击期间缓存从 0 涨到 4），无水印原图优先。
+        if quality != "preview" {
+            if let Ok(items) = self.ori_raw_list().await {
+                if items.len() > before_ori_count {
+                    let item = items.last().unwrap();
+                    println!("[DoubaoClient] 末轮复查 SSE 拦截到无水印原图，采用之");
+                    return Ok(Some(GeneratedImageInfo {
+                        url: item.url.clone(),
+                        is_watermark_free: true,
+                    }));
+                }
+            }
+        }
+
+        // 提取链：DOM → 拦截缓冲区大响应体（模态框大图，体已在内存可直接落盘）
+        //        → 拦截 URL 列表（体竞态丢失时 reqwest 回退下载）
+        let best_url = dom_best_url
+            .or_else(|| {
+                self.intercepted_urls
+                    .iter()
+                    .find(|u| {
+                        self.intercepted_buffers
+                            .get(*u)
+                            .map(|b| b.len() > 100_000)
+                            .unwrap_or(false)
+                    })
+                    .map(|u| {
+                        println!("[DoubaoClient] 采用拦截缓冲区中的大图响应体");
+                        u.clone()
+                    })
+            })
+            .or_else(|| {
+                let fallback = self
+                    .intercepted_urls
+                    .iter()
+                    .rev()
+                    .find(|u| u.contains("image_pre_watermark"))
+                    .or_else(|| {
+                        self.intercepted_urls.iter().rev().find(|u| {
+                            !u.contains("downsize")
+                                && !u.contains("web-operation")
+                                && !u.contains("avatar")
+                        })
+                    })
+                    .cloned();
+                if let Some(u) = &fallback {
+                    println!(
+                        "[DoubaoClient] DOM 未提取到原图，使用网络拦截 URL 兜底: {}...",
+                        &u[..u.len().min(80)]
+                    );
+                }
+                fallback
+            });
 
         if let Some(url) = best_url {
             println!(
@@ -810,11 +1094,18 @@ impl DoubaoClient {
             }));
         }
 
-        println!("[DoubaoClient] 未能获取原图，回退到缩略图");
-        Ok(Some(GeneratedImageInfo {
-            url: target_url,
-            is_watermark_free: false,
-        }))
+        // original 质量下只拿到内联小预览（豆包候选预览是 ~320px 小对象）不算成功：
+        // 返回 None 让上层触发同对话补发重试，而不是静默交付低清图。
+        println!("[DoubaoClient] 未能获取原图级 URL（仅剩内联小预览），本轮判失败");
+        Ok(None)
+    }
+
+    /// 从 imagex 签名 URL 中提取对象 key（`.../<key>.<ext>~tplv-...` 的 key 部分）。
+    /// 同一图片的 downsize/qvalue/raw 等模板变体共享同一 key，可跨变体稳定匹配。
+    fn extract_imagex_key(url: &str) -> String {
+        let path = url.split(['?', '~']).next().unwrap_or(url);
+        let file = path.rsplit('/').next().unwrap_or(path);
+        file.split('.').next().unwrap_or(file).to_string()
     }
 
     /// 上传参考图到聊天附件区。
@@ -945,7 +1236,12 @@ impl DoubaoClient {
                 "#,
                 text
             );
-            let found: bool = page.evaluate(script.as_str()).await?.into_value()?;
+            let found: bool = page
+                .evaluate(script.as_str())
+                .await
+                .ok()
+                .and_then(|v| v.into_value().ok())
+                .unwrap_or(false);
             if found {
                 return Ok(true);
             }
@@ -966,7 +1262,12 @@ impl DoubaoClient {
                 "#,
                 label
             );
-            let found: bool = page.evaluate(script.as_str()).await?.into_value()?;
+            let found: bool = page
+                .evaluate(script.as_str())
+                .await
+                .ok()
+                .and_then(|v| v.into_value().ok())
+                .unwrap_or(false);
             if found {
                 return Ok(true);
             }
@@ -996,8 +1297,10 @@ impl DoubaoClient {
                     return false;
                 })()
             "#)
-            .await?
-            .into_value()?;
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or(false);
 
         Ok(found)
     }
@@ -1026,6 +1329,35 @@ impl DoubaoClient {
             fs::create_dir_all(parent).await?;
         }
 
+        // 签名 URL 偶发连接中断 / 响应体解码失败（error decoding response body），
+        // 做有限重试（最多 3 次，递增退避）。
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=3u32 {
+            if attempt > 1 {
+                println!("[DoubaoClient] 下载重试第 {attempt}/3 次...");
+                sleep(Duration::from_millis(1500 * u64::from(attempt))).await;
+            }
+            match Self::try_download(url).await {
+                Ok(data) => {
+                    fs::write(dest, &data).await?;
+                    println!(
+                        "[DoubaoClient] 图片已保存至: {} ({} bytes)",
+                        dest.display(),
+                        data.len()
+                    );
+                    return Ok(dest.clone());
+                }
+                Err(e) => {
+                    eprintln!("[DoubaoClient] 下载失败（第 {attempt}/3 次）: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("Download failed")))
+    }
+
+    /// 单次下载尝试：返回完整响应体字节。
+    async fn try_download(url: &str) -> Result<Vec<u8>> {
         let client = reqwest::Client::new();
         let resp = client
             .get(url)
@@ -1039,13 +1371,7 @@ impl DoubaoClient {
         }
 
         let data = resp.bytes().await?;
-        fs::write(dest, &data).await?;
-        println!(
-            "[DoubaoClient] 图片已保存至: {} ({} bytes)",
-            dest.display(),
-            data.len()
-        );
-        Ok(dest.clone())
+        Ok(data.to_vec())
     }
 
     pub async fn close(&mut self) {
@@ -1066,6 +1392,19 @@ impl DoubaoClient {
             .await?
             .into_value()?;
         Ok(count)
+    }
+
+    /// 非阻塞读取当前 SSE 拦截到的无水印原图列表（双通道竞速轮询用）。
+    async fn ori_raw_list(&self) -> Result<Vec<ImageOriRawItem>> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not initialized"))?;
+        let items: Vec<ImageOriRawItem> = page
+            .evaluate("window.__doubaoImageOriRaws || []")
+            .await?
+            .into_value()?;
+        Ok(items)
     }
 
     /// 等待并返回新增的 `image_ori_raw` 条目（水印-free 原图）。
