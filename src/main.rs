@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "doubao-web-image")]
 #[command(about = "豆包 Web 端自动化生图工具 (Rust + chromiumoxide)")]
-#[command(version = "1.5.0")]
+#[command(version = "1.5.1")]
 struct Args {
     /// 生图提示词
     #[arg(value_name = "PROMPT")]

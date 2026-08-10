@@ -1518,6 +1518,59 @@ impl DoubaoClient {
         Some(text)
     }
 
+    /// 将对话滚动到底部，触发虚拟列表渲染最新消息。
+    /// 豆包消息列表是虚拟列表（只渲染可视区，探针实测有 v_list/to-bottom-button
+    /// 组件），图片/消息一多时，新追加的内容在不滚动的无头页面里可能根本没挂载
+    /// 进 DOM——直出模式收图必须每轮滚动，否则会出现「图已齐但检测不到」。
+    async fn scroll_chat_to_bottom(&self) {
+        if let Some(page) = self.page.as_ref() {
+            let _ = page
+                .evaluate(
+                    r#"
+                    (function() {
+                        let scrolled = 0;
+                        for (const el of document.querySelectorAll('div, main, section')) {
+                            if (el.scrollHeight > el.clientHeight + 100) {
+                                el.scrollTop = el.scrollHeight;
+                                scrolled++;
+                            }
+                        }
+                        window.scrollTo(0, document.body.scrollHeight);
+                        return scrolled;
+                    })()
+                "#,
+                )
+                .await;
+        }
+    }
+
+    /// 检测 AI 回复文字中的「全套已完成」语义（排除「没/未/不」否定前缀）。
+    fn reply_indicates_complete(text: &str) -> bool {
+        const PHRASES: &[&str] = &[
+            "全部完成",
+            "已全部生成",
+            "已全部完成",
+            "全部生成完毕",
+            "全部出完",
+            "所有图片已",
+            "全部图片已",
+        ];
+        for phrase in PHRASES {
+            let mut start = 0;
+            while let Some(idx) = text[start..].find(phrase) {
+                let abs = start + idx;
+                // 否定前缀检查：短语前 3 个字符内出现 没/未/不 则不算完成
+                let prefix: String = text[..abs].chars().rev().take(3).collect();
+                if prefix.contains('没') || prefix.contains('未') || prefix.contains('不') {
+                    start = abs + phrase.len();
+                    continue;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// --direct 直出收图：整篇消息发出后进入收图循环，把对话里陆续生成的图全部按序收下。
     ///
     /// 收图逻辑复用加固后的双通道件（DOM 新图 diff + SSE image_ori_raw 缓存）：
@@ -1582,6 +1635,9 @@ impl DoubaoClient {
         let mut next_ori = before_ori_count;
         let mut reply_text = String::new();
         let mut poll_count = 0u32;
+        let mut progress_since_continue = true; // 首次催更不受刹车限制
+        let mut brake_announced = false;
+        let mut stall_snapshot: Option<(usize, usize, usize)> = None;
 
         loop {
             sleep(Duration::from_millis(2000)).await;
@@ -1595,11 +1651,16 @@ impl DoubaoClient {
                 break;
             }
 
+            // 0. 滚动对话到底部：虚拟列表只渲染可视区，不滚动则新图/新文字可能
+            //    根本没挂载进 DOM，会造成「图已齐但检测不到」的误判
+            self.scroll_chat_to_bottom().await;
+
             // a. AI 文字回复：气泡在 DOM 中持久存在，取历史最长快照即为全部轮次拼接
             if let Some(text) = self.collect_ai_reply_text().await {
                 if text.len() > reply_text.len() {
                     reply_text = text;
                     last_activity = now;
+                    progress_since_continue = true;
                 }
             }
 
@@ -1611,6 +1672,7 @@ impl DoubaoClient {
                         seen_keys.insert(key);
                         pending.push_back(u);
                         last_activity = now;
+                        progress_since_continue = true;
                         println!(
                             "[DoubaoClient] 发现新图（待收 {} 张）",
                             pending.len()
@@ -1619,7 +1681,8 @@ impl DoubaoClient {
                 }
             }
 
-            // c. 收图：original 与 SSE 原图按序配对，preview 直接下 DOM 图
+            // c. 收图：original 优先消费 SSE 原图——不再以 DOM 发现为前提（虚拟列表
+            //    下 DOM 可能漏显），DOM 队列仅作配对抵消与降级来源；preview 直接下 DOM 图
             if quality == "preview" {
                 while let Some(u) = pending.pop_front() {
                     if images.len() >= max_images {
@@ -1631,14 +1694,16 @@ impl DoubaoClient {
                             println!("[DoubaoClient] 已收第 {} 张（对话预览图）", images.len() + 1);
                             images.push((p, false));
                             last_activity = now;
+                            progress_since_continue = true;
                         }
                         Err(e) => eprintln!("⚠️ 图片下载失败（跳过）: {e}"),
                     }
                 }
             } else if let Ok(ori) = self.ori_raw_list().await {
-                while !pending.is_empty() && ori.len() > next_ori && images.len() < max_images {
+                while ori.len() > next_ori && images.len() < max_images {
                     let item = ori[next_ori].clone();
                     next_ori += 1;
+                    // 与 DOM 发现队列配对抵消一张（DOM 漏显时队列为空，无妨）
                     pending.pop_front();
                     let dest = output_dir.join(format!("img_{:02}.png", images.len()));
                     match Self::download_image(&item.url, &dest).await {
@@ -1651,6 +1716,7 @@ impl DoubaoClient {
                             );
                             images.push((p, true));
                             last_activity = now;
+                            progress_since_continue = true;
                         }
                         Err(e) => eprintln!("⚠️ 图片下载失败（跳过）: {e}"),
                     }
@@ -1662,7 +1728,14 @@ impl DoubaoClient {
                 break;
             }
 
-            // d. 空闲处理：先到轮次空闲阈值则催更，到 settle 则结束
+            // d. 完成语义：AI 明确表示全部完成且已收到图 → 提前收尾
+            //    （收尾阶段还会兜底收一遍 SSE 剩余原图与 pending 预览，不会漏图）
+            if !images.is_empty() && Self::reply_indicates_complete(&reply_text) {
+                println!("[DoubaoClient] 回复文字出现完成语义（全部完成/已全部生成等），提前收尾");
+                break;
+            }
+
+            // e. 空闲处理：先到轮次空闲阈值则催更，到 settle 则结束
             let idle = now.duration_since(last_activity);
             if idle >= settle {
                 println!("[DoubaoClient] {settle_seconds}s 无任何进展，判定收图结束");
@@ -1672,29 +1745,61 @@ impl DoubaoClient {
                 && continues < max_continues
                 && !continue_prompt.trim().is_empty()
             {
-                println!(
-                    "[DoubaoClient] 一轮回复已结束（{}s 无进展），发送催更「{}」（第 {}/{max_continues} 次）",
-                    idle.as_secs(),
-                    continue_prompt,
-                    continues + 1
-                );
-                match self.send_message(continue_prompt, &[]).await {
-                    Ok(()) => {
-                        continues += 1;
-                        last_activity = Instant::now();
-                        // 人性化间隔：催更后缓一缓再恢复轮询
-                        sleep(Duration::from_millis(3000)).await;
+                if !progress_since_continue {
+                    // 刹车：上一次催更颗粒无收——豆包已出完（或检测异常），
+                    // 不再空发催更，让 idle 继续增长直至 settle 收尾
+                    if !brake_announced {
+                        println!("[DoubaoClient] 上次催更后无任何新图/新文字，停止催更，等待 settle 收尾");
+                        brake_announced = true;
                     }
-                    Err(e) => eprintln!("⚠️ 催更发送失败: {e}"),
+                } else {
+                    println!(
+                        "[DoubaoClient] 一轮回复已结束（{}s 无进展），发送催更「{}」（第 {}/{max_continues} 次）",
+                        idle.as_secs(),
+                        continue_prompt,
+                        continues + 1
+                    );
+                    match self.send_message(continue_prompt, &[]).await {
+                        Ok(()) => {
+                            continues += 1;
+                            progress_since_continue = false;
+                            brake_announced = false;
+                            last_activity = Instant::now();
+                            // 人性化间隔：催更后缓一缓再恢复轮询
+                            sleep(Duration::from_millis(3000)).await;
+                        }
+                        Err(e) => eprintln!("⚠️ 催更发送失败: {e}"),
+                    }
                 }
             }
 
+            // f. 空转诊断：每 10 轮快照一次计数；完全不变且页面有图时输出详细诊断
             if poll_count % 10 == 0 {
+                let dom_imgs = self
+                    .current_image_urls()
+                    .await
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                let ori_total = self.ori_raw_count().await.unwrap_or(0);
+                let snapshot = (dom_imgs, ori_total, images.len());
                 println!(
-                    "[DoubaoClient-Debug] 收图中：已存 {} 张，待配对 {} 张，催更 {continues} 次",
+                    "[DoubaoClient-Debug] 收图中：已存 {} 张，待配对 {} 张，DOM img {dom_imgs}，SSE 缓存 {ori_total}，催更 {continues} 次",
                     images.len(),
                     pending.len()
                 );
+                if stall_snapshot == Some(snapshot) && dom_imgs > 0 {
+                    let md_roots = self
+                        .debug_eval("document.querySelectorAll('div.md-box-root').length")
+                        .await;
+                    eprintln!(
+                        "⚠️ 连续 10 轮（约 20s）检测计数完全不变但页面存在 {dom_imgs} 个图片元素。\
+                         诊断：已存={}，待配对={}，SSE 缓存={ori_total}，md-box-root 命中={md_roots:?}。\
+                         可能是虚拟列表未渲染新消息（滚动失效）或图片选择器漂移。",
+                        images.len(),
+                        pending.len()
+                    );
+                }
+                stall_snapshot = Some(snapshot);
             }
         }
 

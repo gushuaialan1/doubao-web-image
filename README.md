@@ -160,7 +160,8 @@ doubao-web-image.exe --direct=plan.json
 
 - 新开一个对话发送 `message`（`ratio` 会按现有语义拼成「，图片比例 X」后缀），随后进入收图循环：对话里**每出现一张新图就按序收下**，命名 `img_00.png, img_01.png ...` 存入 `outputDir`。一轮出 4 宫格候选时按出现顺序全收。
 - original 质量优先使用 SSE 拦截的无水印原图（按到达顺序与 DOM 新图配对）；`noWatermark`、下载重试等语义与单图/--batch 一致。
-- 一轮回复结束（25s 无新图/新文字）且未达 `maxImages` 时自动发送 `continuePrompt` 催更（最多 `maxContinues` 次，设为空字符串可禁用）。
+- 一轮回复结束（25s 无新图/新文字）且未达 `maxImages` 时自动发送 `continuePrompt` 催更（最多 `maxContinues` 次，设为空字符串可禁用）。**催更带刹车**：上一次催更后没有任何新图/新文字即停止催更进入收尾；回复文字出现「全部完成/已全部生成」等完成语义时提前收尾。
+- 收图检测对虚拟列表免疫：每轮自动滚动对话到底部触发渲染（豆包只渲染可视区消息）；original 质量下 SSE 原图的收图不再以 DOM 发现为前提，DOM 漏显也能收全。连续 ~20s 检测计数完全不变且页面有图时会打印诊断信息（DOM img 数/SSE 缓存/选择器命中数）。
 - 结束条件：达到 `maxImages`，或最后一次活动后 `settleSeconds` 内无任何进展。`--timeout-ms` 在此模式下为整个收图循环的最长总时长（默认 1800000ms）。
 - 结束时 stdout 最后一行输出 JSON 摘要（`replyText` 为所有轮次 AI 文字回复的拼接）：
 
