@@ -20,6 +20,8 @@
 - 📥 **直出收图**：`--direct=plan.json` 把整篇文案一条消息发出，按序收下陆续生成的全部图片并抓取文字回复，支持「继续」自动催更。
 - 📏 **比例控制**：支持通过自然语言参数控制图片长宽比（如 `16:9`, `1:1`）。
 - 🛡️ **验证码自动降级**：默认无头模式运行，遇到风控拦截时自动弹窗切换到 UI 模式。
+- 🕵️ **动态自洽身份**：启动后经 CDP `Browser.getVersion` 读取真实浏览器版本，动态生成 UA 与 Client Hints（`userAgentData`），三者（UA / Client Hints / 真实引擎）始终一致，不再有硬编码版本号漂移。
+- 🚫 **风控快速失败**：导航后与生图/收图等待循环中持续检测滑块、点选等验证特征，命中立即报出明确错误（含 profile 路径与 `--ui` 处理指引），不再干等超时。
 - ⚡ **单文件分发**：编译后单个 exe，无需 Node.js、无需 npm install、无需单独下载浏览器。
 
 ## 📦 安装
@@ -209,6 +211,9 @@ doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --quality=ori
 
 ## 🐛 常见问题
 
+- **Q: 提示"检测到豆包风控验证，请用 --ui 模式运行一次手动完成验证"？**
+  - A: 豆包触发了滑块/点选等人机验证，验证状态会粘在 session profile（`~/.doubao-web-session`）上。工具现在会**立即**报出该错误（含 profile 路径）而不是干等超时。按提示带 `--ui` 跑一次，在弹出的浏览器里手动完成验证，之后无头模式即可继续复用该 profile。
+
 - **Q: 提示"未能获取到图片，可能触发了人机验证"？**
   - A: 脚本已内置自动重试机制。当在无头模式下遇到风控，脚本会自动关闭并以 UI 模式重启，给你在浏览器中手动完成验证的机会。
 
@@ -225,6 +230,23 @@ doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --quality=ori
 - **tokio** — 异步运行时
 - **clap** — CLI 参数解析
 - **reqwest** — HTTP 下载 fallback
+
+## 🛡️ 反检测实现说明
+
+- **动态 UA / Client Hints**：不再硬编码 UA。浏览器启动后先经 CDP `Browser.getVersion`
+  读取真实版本（自动下载的浏览器版本会随时间变化），据此生成 UA（无头默认 UA 中的
+  `HeadlessChrome` 替换为 `Chrome`，版本号保留真实值），per-page 经
+  `Emulation.setUserAgentOverride` 覆盖；stealth 脚本里的 `navigator.userAgentData`
+  （brands / fullVersionList）同步注入同一真实版本。reqwest 回退下载也复用同一 UA。
+  启动参数不再设置 `--user-agent=`（启动前拿不到真实版本，硬编码反而自相矛盾；
+  目标页面导航均发生在 per-page override 之后）。
+- **启动参数收敛**：移除 `--disable-gpu`、`--disable-accelerated-2d-canvas`
+  （真实桌面 Chrome 不带这两个 flag，是无头自动化的典型自曝向量）；无头模式升级为
+  新版 `--headless=new`（完整浏览器内核，渲染与指纹更接近有头）。
+- **风控快速失败**：`VERIFICATION_DETECT_SCRIPT` 检测 URL/title 中的 verify/captcha、
+  字节系验证码 SDK 容器（captcha/secsdk 类名与 iframe）、页面文本中的
+  「安全验证/请完成验证/拖动滑块」等特征。检测点：导航完成后、生图等待轮询、
+  直出收图轮询。命中即返回明确错误并附 profile 路径。
 
 ## 📄 License
 

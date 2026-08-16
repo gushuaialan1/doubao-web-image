@@ -203,9 +203,38 @@ const STREAM_INTERCEPTOR_SCRIPT: &str = r#"
 })();
 "#;
 
+/// 风控/验证码页面特征检测脚本（命中返回 true）。
+///
+/// 覆盖三层信号：URL/title 含 verify/captcha/验证、字节系验证码 SDK 的
+/// 容器与 iframe（captcha/secsdk 类名与 id）、页面可见文本含
+/// 「安全验证/请完成验证/拖动滑块」等提示语。
+const VERIFICATION_DETECT_SCRIPT: &str = r#"
+(function() {
+    const url = (location.href || '').toLowerCase();
+    if (url.includes('verify') || url.includes('captcha')) return true;
+    if ((document.title || '').includes('验证')) return true;
+    const selectors = [
+        'iframe[src*="verify"]', 'iframe[src*="captcha"]',
+        '[id*="captcha"]', '[class*="captcha"]',
+        '[id*="secsdk"]', '[class*="secsdk"]',
+        '[id*="verify-"]', '[class*="verify-"]'
+    ];
+    for (const sel of selectors) {
+        for (const el of document.querySelectorAll(sel)) {
+            if (el.tagName === 'IFRAME' || el.offsetParent !== null) return true;
+        }
+    }
+    const phrases = ['安全验证', '请完成验证', '拖动滑块', '向右拖动滑块', '点击完成验证', '验证您的身份'];
+    const bodyText = document.body ? document.body.innerText : '';
+    for (const p of phrases) {
+        if (bodyText.includes(p)) return true;
+    }
+    return false;
+})()
+"#;
+
 #[derive(Debug, serde::Deserialize, Clone)]
-struct ImageOriRawItem {
-    url: String,
+struct ImageOriRawItem {    url: String,
     width: u32,
     height: u32,
 }
@@ -252,6 +281,8 @@ pub struct DoubaoClient {
     browser: Option<Browser>,
     page: Option<Arc<Page>>,
     user_data_dir: PathBuf,
+    /// 浏览器身份（UA + Client Hints 版本），init 时经 CDP `Browser.getVersion` 取真实值。
+    identity: stealth::BrowserIdentity,
     intercepted_buffers: HashMap<String, Vec<u8>>,
     /// 本轮回合中拦截到的所有图片响应 URL（无论响应体是否成功读取）。
     /// GetResponseBody 存在竞态（-32000 No data found），体丢了 URL 仍可走 reqwest 回退下载。
@@ -271,6 +302,7 @@ impl DoubaoClient {
             browser: None,
             page: None,
             user_data_dir,
+            identity: stealth::fallback_identity(),
             intercepted_buffers: HashMap::new(),
             intercepted_urls: Vec::new(),
         })
@@ -289,7 +321,11 @@ impl DoubaoClient {
             .viewport(viewport)
             .user_data_dir(self.user_data_dir.clone())
             .args(stealth::build_stealth_args());
-        if !headless {
+        if headless {
+            // 新版 headless（--headless=new）：完整浏览器内核，渲染/指纹与有头一致，
+            // 比旧版 --headless 的自曝面小得多
+            config_builder = config_builder.new_headless_mode();
+        } else {
             config_builder = config_builder.with_head();
         }
         let config = config_builder.build().map_err(|e| anyhow!("{e}"))?;
@@ -329,8 +365,24 @@ impl DoubaoClient {
             }
         });
 
+        // 取真实浏览器版本，构建自洽身份（UA / Client Hints / 真实引擎三者一致）。
+        // 失败不判死：退回 fallback 身份，行为与旧版硬编码 UA 等价。
+        match browser.version().await {
+            Ok(v) => {
+                self.identity = stealth::identity_from_version(&v.product, &v.user_agent);
+                println!(
+                    "[DoubaoClient] 浏览器版本: {}，动态 UA: {}",
+                    v.product, self.identity.user_agent
+                );
+            }
+            Err(e) => {
+                eprintln!("[DoubaoClient] 获取浏览器版本失败，使用兜底 UA: {e}");
+            }
+        }
+
         // launch 成功后的任何失败都要先关闭浏览器进程再返回，避免残留进程占用 profile
-        let (page, url) = match Self::prepare_page(&browser).await {
+        let identity = self.identity.clone();
+        let (page, url) = match Self::prepare_page(&browser, &identity).await {
             Ok(pair) => pair,
             Err(e) => {
                 let mut browser = browser;
@@ -341,6 +393,11 @@ impl DoubaoClient {
 
         self.browser = Some(browser);
         self.page = Some(Arc::clone(&page));
+
+        // 风控检测：导航后命中验证页立即报明确错误，不再走登录等待等后续逻辑干耗
+        if self.detect_verification().await {
+            return Err(self.verification_error());
+        }
 
         // Check login state
         let has_login_modal = url.contains("login");
@@ -378,24 +435,50 @@ impl DoubaoClient {
         Ok(())
     }
 
+    /// 检测当前页面是否命中豆包风控/验证码特征。CDP 异常（页面销毁等）按未命中处理。
+    async fn detect_verification(&self) -> bool {
+        let Some(page) = self.page.as_ref() else {
+            return false;
+        };
+        page.evaluate(VERIFICATION_DETECT_SCRIPT)
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok())
+            .unwrap_or(false)
+    }
+
+    /// 风控验证错误：明确提示用 --ui 手动过一次验证，并给出 profile 路径
+    /// （验证状态粘在该 profile 上，过一次后无头模式可继续复用）。
+    fn verification_error(&self) -> anyhow::Error {
+        anyhow!(
+            "检测到豆包风控验证，请用 --ui 模式运行一次手动完成验证（profile: {}）",
+            self.user_data_dir.display()
+        )
+    }
+
     /// 创建页面、注入 stealth / SSE 拦截脚本并导航到豆包首页。
     /// 从 init 拆出：调用方在本函数失败时先关闭浏览器进程再返回错误，避免残留。
-    async fn prepare_page(browser: &Browser) -> Result<(Arc<Page>, String)> {
+    async fn prepare_page(
+        browser: &Browser,
+        identity: &stealth::BrowserIdentity,
+    ) -> Result<(Arc<Page>, String)> {
         // Create blank page first, apply stealth, then navigate to target
         let page = Arc::new(browser.new_page("about:blank").await?);
 
-        // Enable chromiumoxide built-in stealth + custom UA
-        page.enable_stealth_mode_with_agent(stealth::USER_AGENT)
+        // Enable chromiumoxide built-in stealth + 动态 UA（来自 CDP 真实版本，
+        // 经 Emulation.setUserAgentOverride 覆盖 HTTP 头与 navigator.userAgent）
+        page.enable_stealth_mode_with_agent(&identity.user_agent)
             .await?;
 
         // Register supplemental stealth script for all future documents/iframes
+        let stealth_script = stealth::build_stealth_script(identity);
         page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
-            stealth::STEALTH_SCRIPT,
+            stealth_script.as_str(),
         ))
         .await?;
 
         // Also inject into current blank page immediately
-        let _ = page.evaluate(stealth::STEALTH_SCRIPT).await?;
+        let _ = page.evaluate(stealth_script.as_str()).await?;
 
         // Inject EventStream interceptor to capture watermark-free image_ori_raw URLs
         page.execute(AddScriptToEvaluateOnNewDocumentParams::new(
@@ -799,6 +882,13 @@ impl DoubaoClient {
         while Instant::now() < deadline {
             sleep(Duration::from_millis(1500)).await;
             poll_count += 1;
+
+            // 风控检测：生图中途触发滑块/点选验证时立即失败并给出可操作提示，
+            // 而不是干等到 timeout（验证不通过图永远不会来）
+            if self.detect_verification().await {
+                intercept_task.abort();
+                return Err(self.verification_error());
+            }
 
             // 通道 1：SSE 拦截的 image_ori_raw 无水印原图（优先，可跳过模态框提取）
             if quality != "preview" {
@@ -1332,10 +1422,10 @@ impl DoubaoClient {
             return Ok(dest.clone());
         }
 
-        Self::download_image(url, dest).await
+        Self::download_image(url, dest, &self.identity.user_agent).await
     }
 
-    pub async fn download_image(url: &str, dest: &PathBuf) -> Result<PathBuf> {
+    pub async fn download_image(url: &str, dest: &PathBuf, ua: &str) -> Result<PathBuf> {
         println!("[DoubaoClient] 正在下载图片至: {}", dest.display());
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
@@ -1349,7 +1439,7 @@ impl DoubaoClient {
                 println!("[DoubaoClient] 下载重试第 {attempt}/3 次...");
                 sleep(Duration::from_millis(1500 * u64::from(attempt))).await;
             }
-            match Self::try_download(url).await {
+            match Self::try_download(url, ua).await {
                 Ok(data) => {
                     fs::write(dest, &data).await?;
                     println!(
@@ -1369,12 +1459,12 @@ impl DoubaoClient {
     }
 
     /// 单次下载尝试：返回完整响应体字节。
-    async fn try_download(url: &str) -> Result<Vec<u8>> {
+    async fn try_download(url: &str, ua: &str) -> Result<Vec<u8>> {
         let client = reqwest::Client::new();
         let resp = client
             .get(url)
             .header("Referer", "https://www.doubao.com/")
-            .header("User-Agent", stealth::USER_AGENT)
+            .header("User-Agent", ua)
             .send()
             .await?;
 
@@ -1651,6 +1741,12 @@ impl DoubaoClient {
                 break;
             }
 
+            // 风控检测：收图中途触发验证立即失败（直出总时长可达 30 分钟，
+            // 干等代价更高）
+            if self.detect_verification().await {
+                return Err(self.verification_error());
+            }
+
             // 0. 滚动对话到底部：虚拟列表只渲染可视区，不滚动则新图/新文字可能
             //    根本没挂载进 DOM，会造成「图已齐但检测不到」的误判
             self.scroll_chat_to_bottom().await;
@@ -1689,7 +1785,7 @@ impl DoubaoClient {
                         break;
                     }
                     let dest = output_dir.join(format!("img_{:02}.png", images.len()));
-                    match Self::download_image(&u, &dest).await {
+                    match Self::download_image(&u, &dest, &self.identity.user_agent).await {
                         Ok(p) => {
                             println!("[DoubaoClient] 已收第 {} 张（对话预览图）", images.len() + 1);
                             images.push((p, false));
@@ -1706,7 +1802,7 @@ impl DoubaoClient {
                     // 与 DOM 发现队列配对抵消一张（DOM 漏显时队列为空，无妨）
                     pending.pop_front();
                     let dest = output_dir.join(format!("img_{:02}.png", images.len()));
-                    match Self::download_image(&item.url, &dest).await {
+                    match Self::download_image(&item.url, &dest, &self.identity.user_agent).await {
                         Ok(p) => {
                             println!(
                                 "[DoubaoClient] 已收第 {} 张（SSE 无水印原图 {}x{}）",
@@ -1812,7 +1908,7 @@ impl DoubaoClient {
                     next_ori += 1;
                     pending.pop_front();
                     let dest = output_dir.join(format!("img_{:02}.png", images.len()));
-                    match Self::download_image(&item.url, &dest).await {
+                    match Self::download_image(&item.url, &dest, &self.identity.user_agent).await {
                         Ok(p) => {
                             println!(
                                 "[DoubaoClient] 收尾补收第 {} 张（SSE 无水印原图）",
@@ -1834,7 +1930,7 @@ impl DoubaoClient {
                 images.len() + 1
             );
             let dest = output_dir.join(format!("img_{:02}.png", images.len()));
-            match Self::download_image(&u, &dest).await {
+            match Self::download_image(&u, &dest, &self.identity.user_agent).await {
                 Ok(p) => images.push((p, false)),
                 Err(e) => eprintln!("⚠️ 收尾下载失败（跳过）: {e}"),
             }

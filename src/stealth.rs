@@ -1,15 +1,66 @@
 use chromiumoxide::handler::viewport::Viewport;
 use rand::Rng;
 
-/// 现代 Chrome User-Agent（Windows 桌面版）
-pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+/// 浏览器身份：UA 字符串与 Client Hints 版本号，全部来自 CDP `Browser.getVersion`
+/// 的真实返回值（保证 UA / Client Hints / 真实引擎三者自洽）。
+#[derive(Debug, Clone)]
+pub struct BrowserIdentity {
+    /// 完整 UA（HeadlessChrome 已替换为 Chrome）
+    pub user_agent: String,
+    /// 大版本号（如 "139"）
+    pub major_version: String,
+    /// 完整版本号（如 "139.0.7258.66"，不足 4 段补 .0）
+    pub full_version: String,
+}
 
-/// 补充 Stealth 脚本。
+/// 兜底身份：仅在 CDP `Browser.getVersion` 异常失败时使用（正常启动后几乎不会走到）。
+pub fn fallback_identity() -> BrowserIdentity {
+    BrowserIdentity {
+        user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36".to_string(),
+        major_version: "135".to_string(),
+        full_version: "135.0.0.0".to_string(),
+    }
+}
+
+/// 从 CDP `Browser.getVersion` 的返回值构建身份。
+///
+/// - `product` 形如 "HeadlessChrome/139.0.7258.66" 或 "Chrome/139.0.7258.66"
+/// - `user_agent` 是浏览器真实默认 UA；无头模式下含 "HeadlessChrome"，
+///   替换为 "Chrome" 后对外呈现（真实引擎版本号原样保留）。
+pub fn identity_from_version(product: &str, user_agent: &str) -> BrowserIdentity {
+    let raw_version = product.rsplit('/').next().unwrap_or(product).trim();
+    let mut parts: Vec<&str> = raw_version.split('.').collect();
+    while parts.len() < 4 {
+        parts.push("0");
+    }
+    let full_version = parts[..4].join(".");
+    let major_version = parts.first().unwrap_or(&"0").to_string();
+
+    let ua = if user_agent.contains("HeadlessChrome") {
+        user_agent.replace("HeadlessChrome", "Chrome")
+    } else if !user_agent.contains("Chrome/") {
+        // 极端情况：默认 UA 不含 Chrome token（理论上不会发生），按版本拼一个
+        format!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_version} Safari/537.36"
+        )
+    } else {
+        user_agent.to_string()
+    };
+
+    BrowserIdentity {
+        user_agent: ua,
+        major_version,
+        full_version,
+    }
+}
+
+/// 补充 Stealth 脚本模板。
 ///
 /// 在 chromiumoxide 内置 `enable_stealth_mode()` 基础上补充以下检测向量：
 /// - navigator.webdriver → undefined（chromiumoxide 设为 false，覆盖为 undefined 更真实）
 /// - navigator.languages / vendor / hardwareConcurrency / deviceMemory / maxTouchPoints
-/// - navigator.userAgentData (Client Hints)
+/// - navigator.userAgentData (Client Hints)——版本号占位符由 `build_stealth_script()`
+///   用 CDP 拿到的真实浏览器版本替换，保证与 UA、真实引擎自洽
 /// - screen 对象
 /// - window.outerWidth/outerHeight
 /// - Notification.permission
@@ -18,7 +69,7 @@ pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 /// - iframe navigator 继承
 /// - Canvas 指纹噪声
 /// - performance.now 单调性
-pub const STEALTH_SCRIPT: &str = r#"
+const STEALTH_SCRIPT_TEMPLATE: &str = r#"
 (() => {
     'use strict';
 
@@ -79,12 +130,15 @@ pub const STEALTH_SCRIPT: &str = r#"
     });
 
     // ===== 7. User Agent Data (Client Hints) =====
+    // 版本号由 Rust 侧用 CDP Browser.getVersion 的真实版本替换（__CHROME_MAJOR__ /
+    // __CHROME_FULL_VERSION__），brand 组合与同期真实桌面 Chrome 一致
+    // （Not/A)Brand v=8 + Chromium + Google Chrome）。
     Object.defineProperty(navigator, 'userAgentData', {
         get: () => ({
             brands: [
-                { brand: 'Google Chrome', version: '135' },
-                { brand: 'Chromium', version: '135' },
-                { brand: 'Not=A?Brand', version: '99' }
+                { brand: 'Not/A)Brand', version: '8' },
+                { brand: 'Chromium', version: '__CHROME_MAJOR__' },
+                { brand: 'Google Chrome', version: '__CHROME_MAJOR__' }
             ],
             mobile: false,
             platform: 'Windows',
@@ -94,11 +148,11 @@ pub const STEALTH_SCRIPT: &str = r#"
                     bitness: '64',
                     model: '',
                     platformVersion: '19.0.0',
-                    uaFullVersion: '135.0.0.0',
+                    uaFullVersion: '__CHROME_FULL_VERSION__',
                     fullVersionList: [
-                        { brand: 'Google Chrome', version: '135.0.0.0' },
-                        { brand: 'Chromium', version: '135.0.0.0' },
-                        { brand: 'Not=A?Brand', version: '99.0.0.0' }
+                        { brand: 'Not/A)Brand', version: '8.0.0.0' },
+                        { brand: 'Chromium', version: '__CHROME_FULL_VERSION__' },
+                        { brand: 'Google Chrome', version: '__CHROME_FULL_VERSION__' }
                     ]
                 });
             }),
@@ -200,12 +254,23 @@ pub const STEALTH_SCRIPT: &str = r#"
 })();
 "#;
 
+/// 用真实浏览器身份实例化 stealth 脚本（替换 Client Hints 版本号占位符）。
+pub fn build_stealth_script(identity: &BrowserIdentity) -> String {
+    STEALTH_SCRIPT_TEMPLATE
+        .replace("__CHROME_MAJOR__", &identity.major_version)
+        .replace("__CHROME_FULL_VERSION__", &identity.full_version)
+}
+
 /// 构建增强的 Chrome 启动参数。
 ///
 /// 参考 puppeteer-extra-stealth 的启动参数列表，移除或禁用可能暴露自动化特征的功能。
+/// 不设置 `--user-agent=`：启动前无法知道自动下载的浏览器真实版本，硬编码会与真实
+/// 引擎不一致；改为启动后经 CDP `Browser.getVersion` 取真实版本，再逐页用
+/// `Emulation.setUserAgentOverride` 覆盖（所有目标页面导航都发生在 override 之后）。
+/// 同时移除了 `--disable-gpu` / `--disable-accelerated-2d-canvas`——真实桌面 Chrome
+/// 不会带这两个 flag，是无头自动化的典型自曝向量。
 pub fn build_stealth_args() -> Vec<String> {
     vec![
-        format!("--user-agent={}", USER_AGENT),
         "--disable-blink-features=AutomationControlled".to_string(),
         "--disable-infobars".to_string(),
         "--disable-web-security".to_string(),
@@ -214,8 +279,6 @@ pub fn build_stealth_args() -> Vec<String> {
         "--disable-dev-shm-usage".to_string(),
         "--no-sandbox".to_string(),
         "--disable-setuid-sandbox".to_string(),
-        "--disable-accelerated-2d-canvas".to_string(),
-        "--disable-gpu".to_string(),
         "--hide-scrollbars".to_string(),
         "--disable-notifications".to_string(),
         "--disable-background-timer-throttling".to_string(),
