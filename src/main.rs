@@ -1,7 +1,14 @@
 use anyhow::Result;
 use clap::Parser;
-use doubao_web_image::client::DoubaoClient;
+use doubao_web_image::client::{DoubaoClient, ERR_PROFILE_LOCKED_TAG};
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// 判断错误是否为「session profile 被存活 chrome 进程占用」类。
+/// 命中时不降级开窗（开窗也会撞同一把锁），由调用方无头重试一次。
+fn is_profile_locked(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains(ERR_PROFILE_LOCKED_TAG)
+}
 
 #[derive(Parser)]
 #[command(name = "doubao-web-image")]
@@ -166,7 +173,7 @@ async fn run() -> Result<()> {
     println!("--- 启动豆包生图客户端 ---");
 
     let mut client = DoubaoClient::new()?;
-    let mut needs_ui_retry = false;
+    let mut ui_retry_reason: Option<String> = None;
     let mut saved_result: Option<(PathBuf, bool)> = None;
 
     // First attempt
@@ -186,9 +193,36 @@ async fn run() -> Result<()> {
             saved_result = Some((path, is_watermark_free));
         }
         Err(e) => {
-            if headless {
+            if headless && is_profile_locked(&e) {
+                // profile 锁冲突：开窗也会撞同一把锁。stale 锁已在 init 内自愈，
+                // 残留进程可能刚退出，等 3s 直接无头重试一次，不再降级开窗
+                println!("\n⚠️ {e}");
+                println!("🔄 profile 锁冲突，不打开浏览器窗口，3s 后直接以无头模式重试一次...");
+                client.close().await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                client = DoubaoClient::new()?;
+                match try_generate(
+                    &mut client,
+                    true,
+                    &prompt,
+                    &quality,
+                    ratio,
+                    &output_path,
+                    &references,
+                    timeout_ms,
+                )
+                .await
+                {
+                    Ok((path, is_watermark_free)) => {
+                        saved_result = Some((path, is_watermark_free));
+                    }
+                    Err(e2) => {
+                        eprintln!("\n❌ 无头重试仍失败（不再自动开窗）: {e2}");
+                    }
+                }
+            } else if headless {
                 println!("\n⚠️ 未能获取到图片: {e}");
-                needs_ui_retry = true;
+                ui_retry_reason = Some(format!("{e}"));
             } else {
                 eprintln!("\n❌ 失败: {e}");
             }
@@ -197,11 +231,11 @@ async fn run() -> Result<()> {
 
     client.close().await;
 
-    // UI retry if headless failed
-    if needs_ui_retry && saved_result.is_none() {
+    // UI retry if headless failed（仅登录失效/验证码等确需人工处理的原因）
+    if let Some(reason) = ui_retry_reason.filter(|_| saved_result.is_none()) {
         println!("\n=============================================");
-        println!("🔄 正在自动以 UI 模式重启...");
-        println!("💡 如果出现验证码，请在浏览器中手动完成。");
+        println!("🔄 现在会打开浏览器窗口，因为：{reason}");
+        println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
         println!("=============================================\n");
 
         let mut client = DoubaoClient::new()?;
@@ -438,15 +472,28 @@ async fn run_batch(plan_path: &PathBuf, args: &Args) -> Result<()> {
         timeout_ms
     );
 
-    // 2. 初始化浏览器（无头失败时降级到 UI 模式，复用单图的降级逻辑）
+    // 2. 初始化浏览器（profile 锁冲突无头重试一次；其余无头失败才降级 UI 模式）
     let mut client = DoubaoClient::new()?;
     match client.init(headless).await {
         Ok(()) => {}
+        Err(e) if headless && is_profile_locked(&e) => {
+            // profile 锁冲突：开窗也会撞同一把锁。stale 锁已在 init 内自愈，
+            // 等 3s 直接无头重试一次，不再降级开窗
+            println!("\n⚠️ 无头模式初始化失败: {e}");
+            println!("🔄 profile 锁冲突，不打开浏览器窗口，3s 后直接以无头模式重试一次...");
+            client.close().await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            client = DoubaoClient::new()?;
+            if let Err(e2) = client.init(true).await {
+                client.close().await;
+                return Err(e2);
+            }
+        }
         Err(e) if headless => {
             println!("\n⚠️ 无头模式初始化失败: {e}");
             client.close().await;
             println!("=============================================");
-            println!("🔄 正在自动以 UI 模式重启...");
+            println!("🔄 现在会打开浏览器窗口，因为：{e}");
             println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
             println!("=============================================\n");
             client = DoubaoClient::new()?;
@@ -682,15 +729,28 @@ async fn run_direct(plan_path: &PathBuf, args: &Args) -> Result<()> {
         overall_timeout_ms
     );
 
-    // 2. 初始化浏览器（无头失败时降级到 UI 模式，复用现有降级逻辑）
+    // 2. 初始化浏览器（profile 锁冲突无头重试一次；其余无头失败才降级 UI 模式）
     let mut client = DoubaoClient::new()?;
     match client.init(headless).await {
         Ok(()) => {}
+        Err(e) if headless && is_profile_locked(&e) => {
+            // profile 锁冲突：开窗也会撞同一把锁。stale 锁已在 init 内自愈，
+            // 等 3s 直接无头重试一次，不再降级开窗
+            println!("\n⚠️ 无头模式初始化失败: {e}");
+            println!("🔄 profile 锁冲突，不打开浏览器窗口，3s 后直接以无头模式重试一次...");
+            client.close().await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            client = DoubaoClient::new()?;
+            if let Err(e2) = client.init(true).await {
+                client.close().await;
+                return Err(e2);
+            }
+        }
         Err(e) if headless => {
             println!("\n⚠️ 无头模式初始化失败: {e}");
             client.close().await;
             println!("=============================================");
-            println!("🔄 正在自动以 UI 模式重启...");
+            println!("🔄 现在会打开浏览器窗口，因为：{e}");
             println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
             println!("=============================================\n");
             client = DoubaoClient::new()?;

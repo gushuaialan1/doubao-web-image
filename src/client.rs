@@ -233,6 +233,14 @@ const VERIFICATION_DETECT_SCRIPT: &str = r#"
 })()
 "#;
 
+/// 豆包输入框选择器。2026-08 起前端把 <textarea> 换成了 tiptap/ProseMirror
+/// contenteditable div（role="textbox"）；两者都匹配以兼容灰度/回滚。
+const COMPOSER_SELECTOR: &str = r#"textarea, [contenteditable="true"][role="textbox"]"#;
+
+/// 「profile 被存活 chrome 进程占用」类错误的标记串，附在错误消息末尾。
+/// main.rs 据此识别锁冲突并走「无头重试一次」而不是「降级开窗」。
+pub const ERR_PROFILE_LOCKED_TAG: &str = "[profile-locked]";
+
 #[derive(Debug, serde::Deserialize, Clone)]
 struct ImageOriRawItem {    url: String,
     width: u32,
@@ -283,6 +291,9 @@ pub struct DoubaoClient {
     user_data_dir: PathBuf,
     /// 浏览器身份（UA + Client Hints 版本），init 时经 CDP `Browser.getVersion` 取真实值。
     identity: stealth::BrowserIdentity,
+    /// 当前是否无头模式（init 时记录）。风控验证命中时：无头快速失败，
+    /// 有头则等用户手动完成验证后继续。
+    headless: bool,
     intercepted_buffers: HashMap<String, Vec<u8>>,
     /// 本轮回合中拦截到的所有图片响应 URL（无论响应体是否成功读取）。
     /// GetResponseBody 存在竞态（-32000 No data found），体丢了 URL 仍可走 reqwest 回退下载。
@@ -303,17 +314,23 @@ impl DoubaoClient {
             page: None,
             user_data_dir,
             identity: stealth::fallback_identity(),
+            headless: true,
             intercepted_buffers: HashMap::new(),
             intercepted_urls: Vec::new(),
         })
     }
 
     pub async fn init(&mut self, headless: bool) -> Result<()> {
+        self.headless = headless;
         println!("[DoubaoClient] Initializing browser (headless: {headless})...");
         println!(
             "[DoubaoClient] User data directory: {}",
             self.user_data_dir.display()
         );
+
+        // 锁自愈：上次进程被超时 kill 留下的 stale DevToolsActivePort 会让本次
+        // 启动直接失败（chrome exit status 21），先检测清理再启动
+        self.heal_stale_devtools_lock()?;
 
         let viewport = stealth::random_viewport();
 
@@ -340,7 +357,7 @@ impl DoubaoClient {
             Ok(Err(e)) => {
                 let hint = if self.user_data_dir.join("DevToolsActivePort").exists() {
                     format!(
-                        "检测到 {} 下存在 DevToolsActivePort，很可能有残留 chrome 进程仍占用该 session profile；请结束命令行包含 .doubao-web-session 的 chrome.exe 后重试。",
+                        "检测到 {} 下存在 DevToolsActivePort，很可能有残留 chrome 进程仍占用该 session profile；请结束命令行包含 .doubao-web-session 的 chrome.exe 后重试。{ERR_PROFILE_LOCKED_TAG}",
                         self.user_data_dir.display()
                     )
                 } else {
@@ -350,7 +367,7 @@ impl DoubaoClient {
             }
             Err(_) => {
                 return Err(anyhow!(
-                    "浏览器启动超时（45s）。session 目录 {} 可能被另一个 doubao-web-image 实例占用，或存在残留的 chrome 进程；请关闭后重试。",
+                    "浏览器启动超时（45s）。session 目录 {} 可能被另一个 doubao-web-image 实例占用，或存在残留的 chrome 进程；请关闭后重试。{ERR_PROFILE_LOCKED_TAG}",
                     self.user_data_dir.display()
                 ));
             }
@@ -394,9 +411,9 @@ impl DoubaoClient {
         self.browser = Some(browser);
         self.page = Some(Arc::clone(&page));
 
-        // 风控检测：导航后命中验证页立即报明确错误，不再走登录等待等后续逻辑干耗
+        // 风控检测：导航后命中验证页——无头立即报明确错误；有头等用户完成验证后继续
         if self.detect_verification().await {
-            return Err(self.verification_error());
+            self.on_verification_detected().await?;
         }
 
         // Check login state
@@ -425,13 +442,36 @@ impl DoubaoClient {
             println!("请在打开的浏览器窗口中完成登录。");
             println!("=============================================\n");
 
-            // Wait for textarea to appear (login successful)
+            // Wait for composer to appear (login successful)
             println!("[DoubaoClient] 等待用户登录...");
-            self.wait_for_element("textarea", 0).await?;
+            self.wait_for_element(COMPOSER_SELECTOR, 0).await?;
             println!("[DoubaoClient] 检测到输入框，登录成功！继续执行。");
         } else {
             println!("[DoubaoClient] 已检测到登录状态。");
         }
+        Ok(())
+    }
+
+    /// 清理 stale 的 DevToolsActivePort 锁。
+    ///
+    /// 上次 CLI 被超时 kill 时 chrome 来不及清理 profile 目录里的
+    /// DevToolsActivePort，下次启动 chrome 会因「profile 被占用」直接退出
+    /// （exit status 21）。文件存在时先查是否真有命令行含 .doubao-web-session
+    /// 的存活 chrome 进程：没有则判定为残骸，自动删除并继续；有才报明确错误
+    /// （带 ERR_PROFILE_LOCKED_TAG，供 main.rs 走无头重试而非降级开窗）。
+    fn heal_stale_devtools_lock(&self) -> Result<()> {
+        let lock = self.user_data_dir.join("DevToolsActivePort");
+        if !lock.exists() {
+            return Ok(());
+        }
+        if chrome_process_alive(&self.user_data_dir) {
+            return Err(anyhow!(
+                "session 目录 {} 正被存活 chrome 进程占用（DevToolsActivePort 存在且进程仍在运行）；请结束命令行包含 .doubao-web-session 的 chrome.exe 后重试。{ERR_PROFILE_LOCKED_TAG}",
+                self.user_data_dir.display()
+            ));
+        }
+        println!("[DoubaoClient] 已清理 stale DevToolsActivePort（无存活 chrome 进程占用该 profile）");
+        let _ = std::fs::remove_file(&lock);
         Ok(())
     }
 
@@ -454,6 +494,34 @@ impl DoubaoClient {
             "检测到豆包风控验证，请用 --ui 模式运行一次手动完成验证（profile: {}）",
             self.user_data_dir.display()
         )
+    }
+
+    /// 风控命中处理：无头模式立即返回明确错误（由上层决定是否开窗重试）；
+    /// 有头模式等用户在窗口里手动完成验证（滑块/点选），验证消失后返回 Ok
+    /// 继续流程，最长等 10 分钟，超时按验证错误处理。
+    async fn on_verification_detected(&self) -> Result<()> {
+        if self.headless {
+            return Err(self.verification_error());
+        }
+        println!("\n=============================================");
+        println!("检测到豆包风控验证（滑块/点选）");
+        println!("请在浏览器窗口中手动完成验证，完成后自动继续（最长等 10 分钟）...");
+        println!("=============================================\n");
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let mut clear_rounds = 0u32;
+        while Instant::now() < deadline {
+            sleep(Duration::from_secs(2)).await;
+            if !self.detect_verification().await {
+                clear_rounds += 1;
+                if clear_rounds >= 2 {
+                    println!("[DoubaoClient] 验证已完成，继续执行。");
+                    return Ok(());
+                }
+            } else {
+                clear_rounds = 0;
+            }
+        }
+        Err(self.verification_error())
     }
 
     /// 创建页面、注入 stealth / SSE 拦截脚本并导航到豆包首页。
@@ -631,28 +699,30 @@ impl DoubaoClient {
             self.upload_references(references).await?;
         }
 
-        // Find and fill textarea (acquire after upload: React may re-render the input area).
+        // Find and fill composer (acquire after upload: React may re-render the input area).
         // 优先用 JS focus/click（对 viewer 残留遮盖、React 重渲染导致的元素句柄失效
         // 免疫——Element::click 在元素无可见区域时会报 No value found），失败再退回元素点击。
+        let focus_script = format!(
+            r#"
+            (function() {{
+                const ta = document.querySelector('{}');
+                if (!ta) return false;
+                ta.focus();
+                ta.click();
+                return true;
+            }})()
+        "#,
+            COMPOSER_SELECTOR
+        );
         let focused: bool = page
-            .evaluate(
-                r#"
-                (function() {
-                    const ta = document.querySelector('textarea');
-                    if (!ta) return false;
-                    ta.focus();
-                    ta.click();
-                    return true;
-                })()
-            "#,
-            )
+            .evaluate(focus_script.as_str())
             .await
             .ok()
             .and_then(|v| v.into_value().ok())
             .unwrap_or(false);
         if !focused {
-            let textarea = self.wait_for_element("textarea", 10000).await?;
-            textarea.click().await?;
+            let composer = self.wait_for_element(COMPOSER_SELECTOR, 10000).await?;
+            composer.click().await?;
         }
         sleep(Duration::from_millis(200)).await;
 
@@ -883,11 +953,13 @@ impl DoubaoClient {
             sleep(Duration::from_millis(1500)).await;
             poll_count += 1;
 
-            // 风控检测：生图中途触发滑块/点选验证时立即失败并给出可操作提示，
-            // 而不是干等到 timeout（验证不通过图永远不会来）
+            // 风控检测：生图中途触发滑块/点选验证——无头立即失败给出可操作提示，
+            // 而不是干等到 timeout；有头等用户手动完成验证后继续等图
             if self.detect_verification().await {
-                intercept_task.abort();
-                return Err(self.verification_error());
+                if self.headless {
+                    intercept_task.abort();
+                }
+                self.on_verification_detected().await?;
             }
 
             // 通道 1：SSE 拦截的 image_ori_raw 无水印原图（优先，可跳过模态框提取）
@@ -1225,27 +1297,30 @@ impl DoubaoClient {
         println!("[DoubaoClient] 正在上传 {} 张参考图...", paths.len());
 
         // 确保页面已就绪
-        self.wait_for_element("textarea", 10000).await?;
+        self.wait_for_element(COMPOSER_SELECTOR, 10000).await?;
 
         // file input 未挂载时，先点击「+」按钮触发挂载
         if page.find_element("input[type=\"file\"]").await.is_err() {
-            let tag_plus = r#"
-(function() {
-    const ta = document.querySelector('textarea');
+            let tag_plus = format!(
+                r#"
+(function() {{
+    const ta = document.querySelector('{}');
     if (!ta) return false;
     let container = ta;
     for (let i = 0; i < 7 && container.parentElement; i++) container = container.parentElement;
-    for (const btn of container.querySelectorAll('button')) {
+    for (const btn of container.querySelectorAll('button')) {{
         const path = btn.querySelector('svg path');
-        if (path && (path.getAttribute('d') || '').startsWith('M12.0005 2.25')) {
+        if (path && (path.getAttribute('d') || '').startsWith('M12.0005 2.25')) {{
             btn.id = '__doubao_plus_btn';
             return true;
-        }
-    }
+        }}
+    }}
     return false;
-})()
-"#;
-            let tagged: bool = page.evaluate(tag_plus).await?.into_value()?;
+}})()
+"#,
+                COMPOSER_SELECTOR
+            );
+            let tagged: bool = page.evaluate(tag_plus.as_str()).await?.into_value()?;
             if tagged {
                 let plus = page.find_element("#__doubao_plus_btn").await?;
                 plus.click().await?;
@@ -1280,22 +1355,24 @@ impl DoubaoClient {
                 return Err(anyhow!("参考图上传超时（60s）"));
             }
             sleep(Duration::from_millis(1000)).await;
-            let status: serde_json::Value = page
-                .evaluate(
-                    r#"
-(function() {
-    const ta = document.querySelector('textarea');
-    if (!ta) return {thumbs: 0, uploading: false};
+            let status_script = format!(
+                r#"
+(function() {{
+    const ta = document.querySelector('{}');
+    if (!ta) return {{thumbs: 0, uploading: false}};
     let container = ta;
     for (let i = 0; i < 9 && container.parentElement; i++) container = container.parentElement;
     const thumbs = container.querySelectorAll('img[src^="blob:"]').length;
     const uploading = container.querySelectorAll(
         '.semi-progress-circle, [class*="loading-overlay"], [class*="progress-text"]'
     ).length > 0;
-    return {thumbs, uploading};
-})()
+    return {{thumbs, uploading}};
+}})()
 "#,
-                )
+                COMPOSER_SELECTOR
+            );
+            let status: serde_json::Value = page
+                .evaluate(status_script.as_str())
                 .await?
                 .into_value()?;
             let thumbs = status["thumbs"].as_u64().unwrap_or(0) as usize;
@@ -1741,10 +1818,10 @@ impl DoubaoClient {
                 break;
             }
 
-            // 风控检测：收图中途触发验证立即失败（直出总时长可达 30 分钟，
-            // 干等代价更高）
+            // 风控检测：收图中途触发验证——无头立即失败（直出总时长可达 30 分钟，
+            // 干等代价更高）；有头等用户完成验证后继续收图
             if self.detect_verification().await {
-                return Err(self.verification_error());
+                self.on_verification_detected().await?;
             }
 
             // 0. 滚动对话到底部：虚拟列表只渲染可视区，不滚动则新图/新文字可能
@@ -1987,5 +2064,51 @@ impl DoubaoClient {
         }
 
         Err(anyhow!("Timeout waiting for element: {selector}"))
+    }
+}
+
+/// 是否有命令行包含 `.doubao-web-session` 的存活 chrome 进程。
+/// 检测失败时保守按「存活」处理（true）——宁可报错让用户手动处理，
+/// 也不误删可能被真实进程占用的锁。
+#[cfg(windows)]
+fn chrome_process_alive(user_data_dir: &Path) -> bool {
+    // 只用单引号，避免嵌套转义；Where-Object 双条件过滤，不依赖已废弃的 WMIC
+    let dir_name = user_data_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".doubao-web-session".to_string());
+    let script = format!(
+        "(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'chrome.exe' -and $_.CommandLine -like '*{dir_name}*' }} | Measure-Object).Count"
+    );
+    match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            match stdout.trim().parse::<u32>() {
+                Ok(count) => count > 0,
+                // 输出解析不了（powershell 报错等）→ 保守按存活处理
+                Err(_) => true,
+            }
+        }
+        Err(_) => true,
+    }
+}
+
+/// 非 Windows：用 pgrep -f 匹配命令行含 profile 目录名的进程（Linux/macOS 均有 pgrep）。
+#[cfg(not(windows))]
+fn chrome_process_alive(user_data_dir: &Path) -> bool {
+    let dir_name = user_data_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".doubao-web-session".to_string());
+    match std::process::Command::new("pgrep")
+        .args(["-f", &dir_name])
+        .output()
+    {
+        // pgrep 命中 exit 0；未命中 exit 1；执行失败保守按存活处理
+        Ok(out) => out.status.success(),
+        Err(_) => true,
     }
 }

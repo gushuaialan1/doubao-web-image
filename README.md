@@ -215,7 +215,10 @@ doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --quality=ori
   - A: 豆包触发了滑块/点选等人机验证，验证状态会粘在 session profile（`~/.doubao-web-session`）上。工具现在会**立即**报出该错误（含 profile 路径）而不是干等超时。按提示带 `--ui` 跑一次，在弹出的浏览器里手动完成验证，之后无头模式即可继续复用该 profile。
 
 - **Q: 提示"未能获取到图片，可能触发了人机验证"？**
-  - A: 脚本已内置自动重试机制。当在无头模式下遇到风控，脚本会自动关闭并以 UI 模式重启，给你在浏览器中手动完成验证的机会。
+  - A: 默认无头运行；只有首次登录、登录失效或确需人工过验证码时才会自动打开浏览器窗口，且日志会写明"现在会打开浏览器窗口，因为：<原因>"。
+
+- **Q: 之前被超时杀掉后总是弹浏览器窗口？**
+  - A: 旧版在 session profile 被锁（`~/.doubao-web-session/DevToolsActivePort` 残留）时会降级开窗，形成"被杀→留锁→开窗→再被杀"的循环。现在启动前会自检：锁文件存在但没有存活 chrome 进程占用时自动清理并继续无头运行；确实有存活进程占用时不再开窗（开窗也会撞同一把锁），等 3s 无头重试一次，仍失败则报明确错误。
 
 - **Q: 提示"找不到 Chrome 浏览器"？**
   - A: 本工具依赖系统中已有的 Chrome/Edge。请确保已安装 Chrome 或 Microsoft Edge。
@@ -246,7 +249,18 @@ doubao-web-image.exe "星空下的赛博朋克城市" --ratio=9:16 --quality=ori
 - **风控快速失败**：`VERIFICATION_DETECT_SCRIPT` 检测 URL/title 中的 verify/captcha、
   字节系验证码 SDK 容器（captcha/secsdk 类名与 iframe）、页面文本中的
   「安全验证/请完成验证/拖动滑块」等特征。检测点：导航完成后、生图等待轮询、
-  直出收图轮询。命中即返回明确错误并附 profile 路径。
+  直出收图轮询。无头模式命中即返回明确错误并附 profile 路径；有头模式（--ui）
+  命中则提示用户在窗口内手动完成验证，验证消失后自动继续（最长等 10 分钟）。
+- **输入框兼容**：豆包前端 2026-08 起把输入框从 `<textarea>` 换成了 tiptap/ProseMirror
+  contenteditable div，统一用 `COMPOSER_SELECTOR`
+  （`textarea, [contenteditable="true"][role="textbox"]`）匹配两种形态。
+- **session 锁自愈与窗口策略**：`init()` 启动前检查 profile 目录的
+  `DevToolsActivePort`——存在时用进程扫描（Windows 走 PowerShell
+  `Get-CimInstance Win32_Process`，非 Windows 走 `pgrep -f`）确认是否真有
+  命令行含 `.doubao-web-session` 的存活 chrome；没有则判定为上次异常退出留下的
+  残骸，自动删除后继续无头启动。只有「确需人工处理」（首次登录、登录失效、
+  验证码）才自动打开浏览器窗口，日志会注明开窗原因；profile 被存活进程占用时
+  不再降级开窗，改为无头重试一次。
 
 ## 📄 License
 
