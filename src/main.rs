@@ -59,8 +59,8 @@ struct Args {
     #[arg(long, value_name = "MS")]
     timeout_ms: Option<u64>,
 
-    /// 风控验证模式：打开浏览器窗口供手动完成验证（滑块/点选），过完自动退出。
-    /// 验证状态粘在 profile 上，过一次后无头模式可继续复用。不生图、不消耗额度。
+    /// 风控验证模式：打开浏览器窗口并提交一张 preview 测试图以触发验证
+    ///（滑块/点选由生成动作触发），用户过完后自动退出。测试图不保留。
     #[arg(long)]
     verify: bool,
 }
@@ -106,16 +106,30 @@ async fn main() {
     }
 }
 
-/// 风控验证模式：有头打开浏览器，命中风控/验证码时等用户手动完成（最长
-/// 10 分钟，逻辑在 init 的风控处理里），未命中则直接就绪。不生图、不消
-/// 耗额度；验证状态粘在 profile 上，后续无头模式复用。
+/// 风控验证模式：有头打开浏览器并提交一张 preview 测试图——风控验证
+/// （滑块/点选）由生成动作触发，只打开首页永远不会弹验证（首版教训）。
+/// 测试图落到临时文件、结束后删除；验证状态粘在 profile 上，后续无头
+/// 生图复用。有头模式下 init/生图中途的风控检测会等用户过完（最长
+/// 10 分钟）再继续。
 async fn run_verify() -> Result<()> {
     println!("--- 风控验证模式 ---");
-    println!("浏览器窗口即将打开：如遇滑块/点选验证请手动完成，完成后自动继续（最长等 10 分钟）。");
+    println!("浏览器窗口即将打开：会自动提交一张测试图（preview，最低成本）来触发验证；");
+    println!("如遇滑块/点选验证请手动完成，完成后自动继续（最长等 10 分钟）。");
+    let tmp = std::env::temp_dir().join(format!("doubao-verify-{}.png", std::process::id()));
     let mut client = DoubaoClient::new()?;
-    // init(false) = 有头；内部已含风控检测 + 有头等待用户过验证的循环。
-    let result = client.init(false).await;
+    let result = try_generate(
+        &mut client,
+        false, // 有头
+        "画一个圆",
+        "preview",
+        Some("1:1"),
+        &tmp,
+        &[],
+        120_000,
+    )
+    .await;
     client.close().await;
+    let _ = std::fs::remove_file(&tmp);
     result?;
     println!("✅ 验证流程完成，profile 已就绪，可回到应用继续生成。");
     Ok(())
