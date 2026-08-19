@@ -58,6 +58,11 @@ struct Args {
     /// 每张图片的等待超时（毫秒）。单图模式默认 120000，批量模式默认 180000
     #[arg(long, value_name = "MS")]
     timeout_ms: Option<u64>,
+
+    /// 风控验证模式：打开浏览器窗口供手动完成验证（滑块/点选），过完自动退出。
+    /// 验证状态粘在 profile 上，过一次后无头模式可继续复用。不生图、不消耗额度。
+    #[arg(long)]
+    verify: bool,
 }
 
 /// 参考图数量上限
@@ -101,8 +106,28 @@ async fn main() {
     }
 }
 
+/// 风控验证模式：有头打开浏览器，命中风控/验证码时等用户手动完成（最长
+/// 10 分钟，逻辑在 init 的风控处理里），未命中则直接就绪。不生图、不消
+/// 耗额度；验证状态粘在 profile 上，后续无头模式复用。
+async fn run_verify() -> Result<()> {
+    println!("--- 风控验证模式 ---");
+    println!("浏览器窗口即将打开：如遇滑块/点选验证请手动完成，完成后自动继续（最长等 10 分钟）。");
+    let mut client = DoubaoClient::new()?;
+    // init(false) = 有头；内部已含风控检测 + 有头等待用户过验证的循环。
+    let result = client.init(false).await;
+    client.close().await;
+    result?;
+    println!("✅ 验证流程完成，profile 已就绪，可回到应用继续生成。");
+    Ok(())
+}
+
 async fn run() -> Result<()> {
     let args = Args::parse();
+
+    // 风控验证模式：--verify 时忽略其他参数，开窗过完验证即退出
+    if args.verify {
+        return run_verify().await;
+    }
 
     // 直出收图模式：--direct=plan.json 时忽略位置参数 PROMPT
     if let Some(plan_path) = &args.direct {
