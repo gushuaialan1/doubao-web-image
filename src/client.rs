@@ -348,7 +348,17 @@ impl DoubaoClient {
         } else {
             config_builder = config_builder.with_head();
         }
-        let config = config_builder.build().map_err(|e| anyhow!("{e}"))?;
+        match chromiumoxide::detection::default_executable(
+            chromiumoxide::detection::DetectionOptions::default(),
+        ) {
+            Ok(path) => println!("[DoubaoClient] 浏览器可执行文件: {}", path.display()),
+            Err(_) => eprintln!("[DoubaoClient] 警告: 未探测到 Chrome/Edge"),
+        }
+        let config = config_builder.build().map_err(|e| {
+            anyhow!(
+                "未找到可用的 Chrome/Edge 浏览器（{e}）。请安装 Google Chrome 或 Microsoft Edge 后重试；也可设置 CHROME 环境变量指定浏览器可执行文件路径。"
+            )
+        })?;
 
         // 浏览器启动加超时 + 明确错误：同一 session profile 被另一个 CLI 实例占用
         // （或有残留 chrome 进程）时，launch 可能挂起或 chrome 启动即退出
@@ -358,14 +368,19 @@ impl DoubaoClient {
         let (browser, mut handler) = match launch_result {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
-                let hint = if self.user_data_dir.join("DevToolsActivePort").exists() {
-                    format!(
+                let mut hint = String::new();
+                if self.user_data_dir.join("DevToolsActivePort").exists() {
+                    hint = format!(
                         "检测到 {} 下存在 DevToolsActivePort，很可能有残留 chrome 进程仍占用该 session profile；请结束命令行包含 .doubao-web-session 的 chrome.exe 后重试。{ERR_PROFILE_LOCKED_TAG}",
                         self.user_data_dir.display()
-                    )
-                } else {
-                    String::new()
-                };
+                    );
+                } else if e.to_string().contains("resolving websocket URL")
+                    || e.to_string().contains("unexpected end of stream")
+                {
+                    // 浏览器进程被拉起后立刻退出且无任何输出：典型原因是杀毒软件/安全管家
+                    // 拦截了「程序启动浏览器 + 调试端口」的行为，或该浏览器安装损坏/版本过旧
+                    hint = "浏览器进程启动后立即退出。常见原因与排查：1) 360/腾讯管家等安全软件拦截了浏览器自动化，请将 doubao-web-image.exe 加入信任/白名单后重试；2) 系统 Chrome/Edge 安装损坏或版本过旧，请重装或升级；3) 如需指定其他浏览器，设置 CHROME 环境变量为浏览器可执行文件路径。".to_string();
+                }
                 return Err(anyhow!("浏览器启动失败: {e}。{hint}"));
             }
             Err(_) => {
