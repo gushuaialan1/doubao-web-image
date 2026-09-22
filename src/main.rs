@@ -580,6 +580,12 @@ async fn run_batch(plan_path: &PathBuf, args: &Args) -> Result<()> {
             );
         }
         results.push(result);
+
+        // 页面健康：同对话批量时图片持续累积，超过阈值自动 reload 防页面退化
+        // （失败不判死，下一轮 generate 会重新快照基线）
+        if let Err(e) = client.maintain_page_health().await {
+            eprintln!("⚠️ 页面健康检查失败（忽略，继续批量）: {e}");
+        }
     }
 
     client.close().await;
@@ -806,7 +812,7 @@ async fn run_direct(plan_path: &PathBuf, args: &Args) -> Result<()> {
         Some(r) => format!("{}，图片比例 {r}", plan.message),
         None => plan.message.clone(),
     };
-    let collection = client
+    let collection = match client
         .run_direct_collection(
             &message,
             &plan.output_dir,
@@ -817,7 +823,18 @@ async fn run_direct(plan_path: &PathBuf, args: &Args) -> Result<()> {
             &quality,
             overall_timeout_ms,
         )
-        .await?;
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // 收图中途失败也必须先关浏览器再返回：main 的错误出口是
+            // std::process::exit(1)，不执行 Drop，不 close 就会留下孤儿
+            // chrome 永远占住 ~/.doubao-web-session 的 profile 锁
+            eprintln!("\n⚠️ 直出收图失败: {e}");
+            client.close().await;
+            return Err(e);
+        }
+    };
 
     client.close().await;
 

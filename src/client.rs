@@ -233,9 +233,12 @@ const VERIFICATION_DETECT_SCRIPT: &str = r#"
 })()
 "#;
 
-/// 豆包输入框选择器。2026-08 起前端把 <textarea> 换成了 tiptap/ProseMirror
-/// contenteditable div（role="textbox"）；两者都匹配以兼容灰度/回滚。
-const COMPOSER_SELECTOR: &str = r#"textarea, [contenteditable="true"][role="textbox"]"#;
+/// 豆包输入框选择器。2026-08 起前端把 <textarea> 换成 tiptap/ProseMirror
+/// contenteditable div；2026-11 实测该 div 已不带 role="textbox"（探针核实
+/// 当前为 div.tiptap.ProseMirror[contenteditable="true"]，全页唯一）。
+/// 三种写法都匹配以兼容后续灰度/回滚。
+const COMPOSER_SELECTOR: &str =
+    r#"textarea, div.tiptap[contenteditable="true"], [contenteditable="true"][role="textbox"]"#;
 
 /// 「profile 被存活 chrome 进程占用」类错误的标记串，附在错误消息末尾。
 /// main.rs 据此识别锁冲突并走「无头重试一次」而不是「降级开窗」。
@@ -652,7 +655,15 @@ impl DoubaoClient {
         // Collect existing image URLs / SSE cache count BEFORE sending so the wait
         // logic can diff against what appears afterwards. Works in a shared
         // conversation that already contains older images (batch mode).
-        let before_urls = self.current_image_urls().await?;
+        let before_urls = match self.current_image_urls().await {
+            Ok(v) => v,
+            Err(e) => {
+                // 快照失败必须 abort 拦截任务再返回，否则 JoinHandle 被 drop 即
+                // detach，任务永久泄漏持续监听整页网络事件（批量失败越多 CDP 越拥塞）
+                intercept_task.abort();
+                return Err(e);
+            }
+        };
         println!(
             "[DoubaoClient-Debug] 发送指令前，已有图片数量: {}",
             before_urls.len()
@@ -664,7 +675,10 @@ impl DoubaoClient {
         );
 
         // Upload references (if any), fill textarea and press Enter
-        self.send_message(fill_text, references).await?;
+        if let Err(e) = self.send_message(fill_text, references).await {
+            intercept_task.abort();
+            return Err(e);
+        }
         println!("[DoubaoClient] 已发送指令，等待图片生成...");
 
         self.wait_for_new_image(
@@ -1536,8 +1550,14 @@ impl DoubaoClient {
     }
 
     /// 单次下载尝试：返回完整响应体字节。
+    ///
+    /// reqwest 默认无任何超时，CDN 半开连接会无限挂住；connect 30s、
+    /// 整体 180s（含响应体）双保险，挂起后由上层重试/总 deadline 兜住。
     async fn try_download(url: &str, ua: &str) -> Result<Vec<u8>> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(180))
+            .build()?;
         let resp = client
             .get(url)
             .header("Referer", "https://www.doubao.com/")
@@ -1553,10 +1573,38 @@ impl DoubaoClient {
         Ok(data.to_vec())
     }
 
+    /// 带总时长预算的下载：直接收图循环内联 await 下载时，循环顶部的
+    /// overall deadline 检查执行不到，必须用剩余时间把下载包一层 timeout。
+    async fn download_with_deadline(
+        url: &str,
+        dest: &PathBuf,
+        ua: &str,
+        deadline: Instant,
+    ) -> Result<PathBuf> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let budget = remaining.max(Duration::from_secs(30));
+        tokio::time::timeout(budget, Self::download_image(url, dest, ua))
+            .await
+            .map_err(|_| anyhow!("下载超过总时长预算（{budget:?}），跳过"))?
+    }
+
     pub async fn close(&mut self) {
         if let Some(mut browser) = self.browser.take() {
-            let _ = browser.close().await;
-            println!("[DoubaoClient] 浏览器已关闭。");
+            // close 走 CDP CloseBrowser（有 30s 请求超时兜底），但 handler 拥塞时可能
+            // 拖很久；包一层硬超时，失败则强杀子进程，绝不留孤儿 chrome 占住 profile 锁
+            match tokio::time::timeout(Duration::from_secs(15), browser.close()).await {
+                Ok(Ok(_)) => println!("[DoubaoClient] 浏览器已关闭。"),
+                Ok(Err(e)) => {
+                    eprintln!("[DoubaoClient] 浏览器关闭失败，强制 kill: {e}");
+                    let _ = browser.kill().await;
+                }
+                Err(_) => {
+                    eprintln!("[DoubaoClient] 浏览器关闭超时（15s），强制 kill。");
+                    let _ = browser.kill().await;
+                }
+            }
+            // 回收子进程句柄，避免 zombie
+            let _ = browser.wait().await;
         }
     }
 
@@ -1683,6 +1731,41 @@ impl DoubaoClient {
             .ok()
             .and_then(|v| v.into_value().ok())?;
         Some(text)
+    }
+
+    /// 页面健康维护（长会话防退化）：batch/direct 全程不刷新页面，对话里图片
+    /// 越堆越多（单张原图 3MB+），每轮全页 DOM 扫描越来越卡，CDP 超时增多会
+    /// 把等图误判成超时。对话内图片超过阈值时 reload 释放内存——URL 不变，
+    /// 会话上下文随页面恢复；AddScriptToEvaluateOnNewDocument 注册的拦截脚本
+    /// 在 reload 后自动重装（此处再幂等补注一次保险），
+    /// window.__doubaoImageOriRaws 随文档重置归零。
+    ///
+    /// 返回 `Some(新基线)` 表示发生了 reload（调用方须用它重置 SSE 原图计数
+    /// 基线，否则会丢弃 reload 后新拦截到的原图）；`None` 表示未触发。
+    pub async fn maintain_page_health(&mut self) -> Result<Option<usize>> {
+        const RELOAD_IMAGE_THRESHOLD: usize = 20;
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| anyhow!("Not initialized"))?;
+        let count: usize = page
+            .evaluate(r#"document.querySelectorAll('img[src*="flow-imagex-sign"]').length"#)
+            .await?
+            .into_value()?;
+        if count < RELOAD_IMAGE_THRESHOLD {
+            return Ok(None);
+        }
+        println!(
+            "[DoubaoClient] 对话内图片已累积 {count} 张，刷新页面释放内存（同一会话，上下文保留）..."
+        );
+        page.reload().await?;
+        self.wait_for_element(COMPOSER_SELECTOR, 30_000).await?;
+        sleep(Duration::from_millis(3000)).await;
+        // 保险：新文档若因任何原因没等到自动重装，补注入一次（幂等 guard）
+        self.ensure_stream_interceptor().await;
+        let baseline = self.ori_raw_count().await.unwrap_or(0);
+        println!("[DoubaoClient] 页面已刷新，SSE 无水印原图缓存基线重置为 {baseline}");
+        Ok(Some(baseline))
     }
 
     /// 将对话滚动到底部，触发虚拟列表渲染最新消息。
@@ -1862,7 +1945,7 @@ impl DoubaoClient {
                         break;
                     }
                     let dest = output_dir.join(format!("img_{:02}.png", images.len()));
-                    match Self::download_image(&u, &dest, &self.identity.user_agent).await {
+                    match Self::download_with_deadline(&u, &dest, &self.identity.user_agent, deadline).await {
                         Ok(p) => {
                             println!("[DoubaoClient] 已收第 {} 张（对话预览图）", images.len() + 1);
                             images.push((p, false));
@@ -1879,7 +1962,7 @@ impl DoubaoClient {
                     // 与 DOM 发现队列配对抵消一张（DOM 漏显时队列为空，无妨）
                     pending.pop_front();
                     let dest = output_dir.join(format!("img_{:02}.png", images.len()));
-                    match Self::download_image(&item.url, &dest, &self.identity.user_agent).await {
+                    match Self::download_with_deadline(&item.url, &dest, &self.identity.user_agent, deadline).await {
                         Ok(p) => {
                             println!(
                                 "[DoubaoClient] 已收第 {} 张（SSE 无水印原图 {}x{}）",
@@ -1946,7 +2029,22 @@ impl DoubaoClient {
                 }
             }
 
-            // f. 空转诊断：每 10 轮快照一次计数；完全不变且页面有图时输出详细诊断
+            // f. 页面健康：长会话图片累积过多时 reload 释放内存，防 DOM 扫描退化
+            //    拖垮 CDP。pending 非空说明有已发现未下载的图，reload 会让其签名 URL
+            //    悬在过期边缘，此时不刷新。
+            if poll_count % 10 == 0 && pending.is_empty() && images.len() < max_images {
+                match self.maintain_page_health().await {
+                    Ok(Some(baseline)) => {
+                        next_ori = baseline;
+                        // reload 重新渲染整页，视为一次活动避免误 settle
+                        last_activity = Instant::now();
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("⚠️ 页面健康检查失败（忽略）: {e}"),
+                }
+            }
+
+            // g. 空转诊断：每 10 轮快照一次计数；完全不变且页面有图时输出详细诊断
             if poll_count % 10 == 0 {
                 let dom_imgs = self
                     .current_image_urls()
@@ -1985,7 +2083,7 @@ impl DoubaoClient {
                     next_ori += 1;
                     pending.pop_front();
                     let dest = output_dir.join(format!("img_{:02}.png", images.len()));
-                    match Self::download_image(&item.url, &dest, &self.identity.user_agent).await {
+                    match Self::download_with_deadline(&item.url, &dest, &self.identity.user_agent, deadline).await {
                         Ok(p) => {
                             println!(
                                 "[DoubaoClient] 收尾补收第 {} 张（SSE 无水印原图）",
@@ -2007,7 +2105,7 @@ impl DoubaoClient {
                 images.len() + 1
             );
             let dest = output_dir.join(format!("img_{:02}.png", images.len()));
-            match Self::download_image(&u, &dest, &self.identity.user_agent).await {
+            match Self::download_with_deadline(&u, &dest, &self.identity.user_agent, deadline).await {
                 Ok(p) => images.push((p, false)),
                 Err(e) => eprintln!("⚠️ 收尾下载失败（跳过）: {e}"),
             }
