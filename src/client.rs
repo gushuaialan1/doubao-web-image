@@ -3,7 +3,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chromiumoxide::Page;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
-use chromiumoxide::cdp::browser_protocol::network::{EventResponseReceived, GetResponseBodyParams};
+use chromiumoxide::cdp::browser_protocol::network::{
+    EventResponseReceived, GetCookiesParams, GetResponseBodyParams,
+};
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, NavigateParams,
 };
@@ -305,11 +307,22 @@ pub struct DoubaoClient {
 
 impl DoubaoClient {
     pub fn new() -> Result<Self> {
-        let home = directories::BaseDirs::new()
-            .ok_or_else(|| anyhow!("Cannot determine home directory"))?
-            .home_dir()
-            .to_path_buf();
-        let user_data_dir = home.join(".doubao-web-session");
+        Self::with_user_data_dir(None)
+    }
+
+    /// user_data_dir 覆盖（--user-data-dir）：多账号、未登录隔离测试等场景
+    /// 使用独立 profile 目录；None 时用默认的 ~/.doubao-web-session。
+    pub fn with_user_data_dir(override_dir: Option<PathBuf>) -> Result<Self> {
+        let user_data_dir = match override_dir {
+            Some(d) => d,
+            None => {
+                let home = directories::BaseDirs::new()
+                    .ok_or_else(|| anyhow!("Cannot determine home directory"))?
+                    .home_dir()
+                    .to_path_buf();
+                home.join(".doubao-web-session")
+            }
+        };
         std::fs::create_dir_all(&user_data_dir)?;
 
         Ok(Self {
@@ -434,21 +447,15 @@ impl DoubaoClient {
             self.on_verification_detected().await?;
         }
 
-        // Check login state
-        let has_login_modal = url.contains("login");
-        let login_text_visible: bool = page
-            .evaluate(
-                r#"
-                Array.from(document.querySelectorAll('button, a, div, span'))
-                    .some(el => el.textContent.includes('登录') && el.offsetParent !== null)
-            "#,
-            )
-            .await?
-            .into_value()?;
+        // Check login state：主判据是 cookie 里的 sessionid（doubao-free-api 系
+        // 验证过的可靠信号）；未登录时 composer 其实也在 DOM 里（被登录弹窗盖着），
+        // 不能靠等 composer 判定登录成功。辅助判据：登录弹窗（手机号输入框）。
+        let logged_in = self.is_logged_in().await;
+        let login_modal = self.login_modal_visible().await;
 
-        if has_login_modal || login_text_visible {
+        if !logged_in || login_modal || url.contains("login") {
             println!("\n=============================================");
-            println!("需要登录豆包");
+            println!("需要登录豆包（登录 cookie 缺失或检测到登录弹窗）");
 
             if headless {
                 println!("当前处于无头模式，无法进行手动登录。");
@@ -460,14 +467,72 @@ impl DoubaoClient {
             println!("请在打开的浏览器窗口中完成登录。");
             println!("=============================================\n");
 
-            // Wait for composer to appear (login successful)
-            println!("[DoubaoClient] 等待用户登录...");
-            self.wait_for_element(COMPOSER_SELECTOR, 0).await?;
-            println!("[DoubaoClient] 检测到输入框，登录成功！继续执行。");
+            // 轮询登录 cookie + 弹窗状态直到真登录（未登录时 composer 也在 DOM
+            // 里，不能用作判据），最长等 10 分钟
+            println!("[DoubaoClient] 等待用户登录（轮询登录 cookie）...");
+            let deadline = Instant::now() + Duration::from_secs(600);
+            loop {
+                sleep(Duration::from_secs(2)).await;
+                if self.is_logged_in().await && !self.login_modal_visible().await {
+                    println!("[DoubaoClient] 检测到登录 cookie，登录成功！继续执行。");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow!("等待登录超时（10 分钟），请完成后重试"));
+                }
+            }
         } else {
             println!("[DoubaoClient] 已检测到登录状态。");
         }
         Ok(())
+    }
+
+    /// 登录态主判据：经 CDP Network.getCookies 查 .doubao.com 是否含 sessionid。
+    /// 该 cookie 是 HttpOnly（探针实测），document.cookie 不可见，必须走 CDP；
+    /// 信号与 doubao-free-api 系一致。CDP 异常按未登录处理（保守：宁可要求
+    /// 登录，不可假阳性放行）。
+    async fn is_logged_in(&self) -> bool {
+        let Some(page) = self.page.as_ref() else {
+            return false;
+        };
+        let cookies = match page
+            .execute(GetCookiesParams {
+                urls: Some(vec!["https://www.doubao.com/".to_string()]),
+            })
+            .await
+        {
+            Ok(ret) => ret.result.cookies,
+            Err(_) => return false,
+        };
+        cookies.iter().any(|c| c.name == "sessionid")
+    }
+
+    /// 登录弹窗检测：未登录时豆包弹手机号登录框盖在输入区上（composer 仍在
+    /// DOM 里，单独检测它会误判已登录）。命中任一即视为弹窗出现：
+    /// 可见的手机号输入框，或含「手机号/登录」文案的可见对话框。
+    async fn login_modal_visible(&self) -> bool {
+        let Some(page) = self.page.as_ref() else {
+            return false;
+        };
+        page.evaluate(
+            r#"(function() {
+                const tel = document.querySelector('input[type="tel"]');
+                if (tel && tel.offsetParent !== null) return true;
+                const dialogs = document.querySelectorAll('[role="dialog"], [class*="modal"]');
+                for (const d of dialogs) {
+                    if (d.offsetParent === null) continue;
+                    const t = (d.innerText || '');
+                    if (t.includes('手机号') || (t.includes('登录') && t.includes('验证码'))) {
+                        return true;
+                    }
+                }
+                return false;
+            })()"#,
+        )
+        .await
+        .ok()
+        .and_then(|v| v.into_value().ok())
+        .unwrap_or(false)
     }
 
     /// 清理 stale 的 DevToolsActivePort 锁。
@@ -991,22 +1056,37 @@ impl DoubaoClient {
                 self.on_verification_detected().await?;
             }
 
+            // 登录态保险：发送后等待期间弹出登录框（手机号输入）说明登录态
+            // 已失效，立刻报错而不是干等到超时
+            if self.login_modal_visible().await {
+                intercept_task.abort();
+                return Err(anyhow!(
+                    "登录态失效：发送消息后弹出登录窗口，请用 --ui 模式重新登录"
+                ));
+            }
+
             // 通道 1：SSE 拦截的 image_ori_raw 无水印原图（优先，可跳过模态框提取）
             if quality != "preview" {
                 match self.ori_raw_list().await {
                     Ok(items) if items.len() > before_ori_count => {
-                        let item = items.last().unwrap();
-                        println!(
-                            "[DoubaoClient] SSE 拦截到无水印原图 ({}x{}): {}...",
-                            item.width,
-                            item.height,
-                            &item.url[..item.url.len().min(60)]
-                        );
-                        intercept_task.abort();
-                        return Ok(Some(GeneratedImageInfo {
-                            url: item.url.clone(),
-                            is_watermark_free: true,
-                        }));
+                        match Self::last_valid_ori(&items, before_ori_count) {
+                            Some(item) => {
+                                println!(
+                                    "[DoubaoClient] SSE 拦截到无水印原图 ({}x{}): {}...",
+                                    item.width,
+                                    item.height,
+                                    &item.url[..item.url.len().min(60)]
+                                );
+                                intercept_task.abort();
+                                return Ok(Some(GeneratedImageInfo {
+                                    url: item.url.clone(),
+                                    is_watermark_free: true,
+                                }));
+                            }
+                            None => eprintln!(
+                                "[DoubaoClient-Debug] SSE 缓存新增条目 URL 形态非法（疑似 icon/占位），继续等待"
+                            ),
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -1075,12 +1155,18 @@ impl DoubaoClient {
         // 拿到无水印原图就免走模态框；拿不到再进模态框提取。
         if quality != "preview" {
             if let Ok(Some(item)) = self.poll_new_ori_raw(before_ori_count, 8_000).await {
-                println!("[DoubaoClient] 宽限期内 SSE 拦截到无水印原图，跳过模态框提取");
-                intercept_task.abort();
-                return Ok(Some(GeneratedImageInfo {
-                    url: item.url,
-                    is_watermark_free: true,
-                }));
+                if Self::looks_like_image_url(&item.url) {
+                    println!("[DoubaoClient] 宽限期内 SSE 拦截到无水印原图，跳过模态框提取");
+                    intercept_task.abort();
+                    return Ok(Some(GeneratedImageInfo {
+                        url: item.url,
+                        is_watermark_free: true,
+                    }));
+                }
+                eprintln!(
+                    "[DoubaoClient-Debug] 宽限期 SSE 条目 URL 形态非法（{}...），忽略",
+                    &item.url[..item.url.len().min(60)]
+                );
             }
         }
 
@@ -1235,8 +1321,7 @@ impl DoubaoClient {
         // （实测宽限期结束后、模态框点击期间缓存从 0 涨到 4），无水印原图优先。
         if quality != "preview" {
             if let Ok(items) = self.ori_raw_list().await {
-                if items.len() > before_ori_count {
-                    let item = items.last().unwrap();
+                if let Some(item) = Self::last_valid_ori(&items, before_ori_count) {
                     println!("[DoubaoClient] 末轮复查 SSE 拦截到无水印原图，采用之");
                     return Ok(Some(GeneratedImageInfo {
                         url: item.url.clone(),
@@ -1247,16 +1332,28 @@ impl DoubaoClient {
         }
 
         // 提取链：DOM → 拦截缓冲区大响应体（模态框大图，体已在内存可直接落盘）
-        //        → 拦截 URL 列表（体竞态丢失时 reqwest 回退下载）
+        //        → 拦截 URL 列表（体竞态丢失时 reqwest 回退下载）。
+        //        每一路都过 URL 形态校验，拒绝 /rc/icon/ 之类的网站静态资源——
+        //        提取不到宁可判失败重试，绝不把 icon 当原图交付（假成功）。
         let best_url = dom_best_url
+            .filter(|u| {
+                if Self::looks_like_image_url(u) {
+                    true
+                } else {
+                    eprintln!("[DoubaoClient-Debug] DOM 提取 URL 形态非法（{}...），拒绝", &u[..u.len().min(60)]);
+                    false
+                }
+            })
             .or_else(|| {
                 self.intercepted_urls
                     .iter()
                     .find(|u| {
-                        self.intercepted_buffers
-                            .get(*u)
-                            .map(|b| b.len() > 100_000)
-                            .unwrap_or(false)
+                        Self::looks_like_image_url(u)
+                            && self
+                                .intercepted_buffers
+                                .get(*u)
+                                .map(|b| b.len() > 100_000)
+                                .unwrap_or(false)
                     })
                     .map(|u| {
                         println!("[DoubaoClient] 采用拦截缓冲区中的大图响应体");
@@ -1271,9 +1368,9 @@ impl DoubaoClient {
                     .find(|u| u.contains("image_pre_watermark"))
                     .or_else(|| {
                         self.intercepted_urls.iter().rev().find(|u| {
-                            !u.contains("downsize")
+                            Self::looks_like_image_url(u)
+                                && !u.contains("downsize")
                                 && !u.contains("web-operation")
-                                && !u.contains("avatar")
                         })
                     })
                     .cloned();
@@ -1301,6 +1398,40 @@ impl DoubaoClient {
         // 返回 None 让上层触发同对话补发重试，而不是静默交付低清图。
         println!("[DoubaoClient] 未能获取原图级 URL（仅剩内联小预览），本轮判失败");
         Ok(None)
+    }
+
+    /// 生图 URL 形态校验：期望 imagex 签名图链（tos-cn-i-*/imagex/byteimg）。
+    /// 拒绝网站静态资源（/rc/icon/、avatar 等）——未登录/异常页面会把 ~3KB 的
+    /// 网站 icon 当原图收下（假成功案例：下载 3353 bytes 宣布成功）。
+    fn looks_like_image_url(url: &str) -> bool {
+        (url.contains("imagex") || url.contains("byteimg"))
+            && !url.contains("/rc/icon/")
+            && !url.contains("avatar")
+    }
+
+    /// 下载内容校验：必须能用 image crate 解码成图片且宽高都 ≥256
+    /// （真实生图最小也在 512px+，豆包内联预览 ~320px；icon/占位图通常 64px 内）。
+    fn validate_image_bytes(data: &[u8]) -> Result<()> {
+        let img = image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()?
+            .decode()
+            .map_err(|e| anyhow!("下载内容无法解码为图片: {e}"))?;
+        let (w, h) = (img.width(), img.height());
+        if w < 256 || h < 256 {
+            return Err(anyhow!("图片尺寸 {w}x{h} 小于 256x256，疑似 icon/占位图"));
+        }
+        Ok(())
+    }
+
+    /// 从 SSE 缓存新增项（下标 ≥ before）里取最后一条通过 URL 形态校验的原图；
+    /// 新增项全部非法时返回 None——调用方继续等，而不是把 icon 链接当原图。
+    fn last_valid_ori(items: &[ImageOriRawItem], before: usize) -> Option<ImageOriRawItem> {
+        items
+            .get(before..)?
+            .iter()
+            .rev()
+            .find(|it| Self::looks_like_image_url(&it.url))
+            .cloned()
     }
 
     /// 从 imagex 签名 URL 中提取对象 key（`.../<key>.<ext>~tplv-...` 的 key 部分）。
@@ -1515,17 +1646,27 @@ impl DoubaoClient {
 
     pub async fn download_with_page(&self, url: &str, dest: &PathBuf) -> Result<PathBuf> {
         if let Some(data) = self.intercepted_buffers.get(url) {
-            println!("[DoubaoClient] 使用浏览器拦截的原图数据保存...");
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).await?;
+            // 与 download_image 相同的假成功防护：拦截体也可能是小图标，
+            // 校验失败不硬错，落到下方 reqwest 回退下载
+            match Self::validate_image_bytes(data) {
+                Ok(()) => {
+                    println!("[DoubaoClient] 使用浏览器拦截的原图数据保存...");
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent).await?;
+                    }
+                    fs::write(dest, data).await?;
+                    println!(
+                        "[DoubaoClient] 图片已保存至: {} ({} bytes)",
+                        dest.display(),
+                        data.len()
+                    );
+                    return Ok(dest.clone());
+                }
+                Err(e) => eprintln!(
+                    "[DoubaoClient] 拦截数据校验失败（{} bytes）: {e:#}，改走回退下载",
+                    data.len()
+                ),
             }
-            fs::write(dest, data).await?;
-            println!(
-                "[DoubaoClient] 图片已保存至: {} ({} bytes)",
-                dest.display(),
-                data.len()
-            );
-            return Ok(dest.clone());
         }
 
         Self::download_image(url, dest, &self.identity.user_agent).await
@@ -1547,6 +1688,13 @@ impl DoubaoClient {
             }
             match Self::try_download(url, ua).await {
                 Ok(data) => {
+                    // 假成功防护：内容必须是 ≥256px 的真图片（未登录场景曾把
+                    // 3.3KB 网站 icon 当原图保存）；校验失败不重试（同 URL 重试
+                    // 无意义），删文件并报明确错误
+                    if let Err(e) = Self::validate_image_bytes(&data) {
+                        let _ = fs::remove_file(dest).await;
+                        return Err(e.context(format!("下载内容校验失败（{} bytes）", data.len())));
+                    }
                     fs::write(dest, &data).await?;
                     println!(
                         "[DoubaoClient] 图片已保存至: {} ({} bytes)",
@@ -1920,6 +2068,13 @@ impl DoubaoClient {
             // 干等代价更高）；有头等用户完成验证后继续收图
             if self.detect_verification().await {
                 self.on_verification_detected().await?;
+            }
+
+            // 登录态保险：同 wait_for_new_image，弹出登录框立即失败
+            if self.login_modal_visible().await {
+                return Err(anyhow!(
+                    "登录态失效：发送消息后弹出登录窗口，请用 --ui 模式重新登录"
+                ));
             }
 
             // 0. 滚动对话到底部：虚拟列表只渲染可视区，不滚动则新图/新文字可能

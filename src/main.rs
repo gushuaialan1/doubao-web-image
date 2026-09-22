@@ -63,6 +63,10 @@ struct Args {
     ///（滑块/点选由生成动作触发），用户过完后自动退出。测试图不保留。
     #[arg(long)]
     verify: bool,
+
+    /// 浏览器 profile 目录（默认 ~/.doubao-web-session；多账号、隔离测试用）
+    #[arg(long, value_name = "DIR")]
+    user_data_dir: Option<PathBuf>,
 }
 
 /// 参考图数量上限
@@ -111,12 +115,12 @@ async fn main() {
 /// 测试图落到临时文件、结束后删除；验证状态粘在 profile 上，后续无头
 /// 生图复用。有头模式下 init/生图中途的风控检测会等用户过完（最长
 /// 10 分钟）再继续。
-async fn run_verify() -> Result<()> {
+async fn run_verify(args: &Args) -> Result<()> {
     println!("--- 风控验证模式 ---");
     println!("浏览器窗口即将打开：会自动提交一张测试图（preview，最低成本）来触发验证；");
     println!("如遇滑块/点选验证请手动完成，完成后自动继续（最长等 10 分钟）。");
     let tmp = std::env::temp_dir().join(format!("doubao-verify-{}.png", std::process::id()));
-    let mut client = DoubaoClient::new()?;
+    let mut client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
     let result = try_generate(
         &mut client,
         false, // 有头
@@ -140,7 +144,7 @@ async fn run() -> Result<()> {
 
     // 风控验证模式：--verify 时忽略其他参数，开窗过完验证即退出
     if args.verify {
-        return run_verify().await;
+        return run_verify(&args).await;
     }
 
     // 直出收图模式：--direct=plan.json 时忽略位置参数 PROMPT
@@ -177,6 +181,7 @@ async fn run() -> Result<()> {
     --batch=<PLAN_JSON>     同对话批量生图模式（plan.json 描述 context 与 items）
     --direct=<PLAN_JSON>    直出收图模式（整篇文案一条消息发出，按序收全部图+文字回复）
     --timeout-ms=<MS>       每张图片的等待超时（单图默认 120000，批量默认 180000，直出为总时长默认 1800000）
+    --user-data-dir=<DIR>   浏览器 profile 目录（默认 ~/.doubao-web-session；多账号、隔离测试用）
     -h, --help              显示帮助
     -V, --version           显示版本
 
@@ -211,7 +216,7 @@ async fn run() -> Result<()> {
 
     println!("--- 启动豆包生图客户端 ---");
 
-    let mut client = DoubaoClient::new()?;
+    let mut client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
     let mut ui_retry_reason: Option<String> = None;
     let mut saved_result: Option<(PathBuf, bool)> = None;
 
@@ -239,7 +244,7 @@ async fn run() -> Result<()> {
                 println!("🔄 profile 锁冲突，不打开浏览器窗口，3s 后直接以无头模式重试一次...");
                 client.close().await;
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                client = DoubaoClient::new()?;
+                client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
                 match try_generate(
                     &mut client,
                     true,
@@ -277,7 +282,7 @@ async fn run() -> Result<()> {
         println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
         println!("=============================================\n");
 
-        let mut client = DoubaoClient::new()?;
+        let mut client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
         match try_generate(
             &mut client,
             false,
@@ -512,7 +517,7 @@ async fn run_batch(plan_path: &PathBuf, args: &Args) -> Result<()> {
     );
 
     // 2. 初始化浏览器（profile 锁冲突无头重试一次；其余无头失败才降级 UI 模式）
-    let mut client = DoubaoClient::new()?;
+    let mut client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
     match client.init(headless).await {
         Ok(()) => {}
         Err(e) if headless && is_profile_locked(&e) => {
@@ -522,7 +527,7 @@ async fn run_batch(plan_path: &PathBuf, args: &Args) -> Result<()> {
             println!("🔄 profile 锁冲突，不打开浏览器窗口，3s 后直接以无头模式重试一次...");
             client.close().await;
             tokio::time::sleep(Duration::from_secs(3)).await;
-            client = DoubaoClient::new()?;
+            client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
             if let Err(e2) = client.init(true).await {
                 client.close().await;
                 return Err(e2);
@@ -535,7 +540,7 @@ async fn run_batch(plan_path: &PathBuf, args: &Args) -> Result<()> {
             println!("🔄 现在会打开浏览器窗口，因为：{e}");
             println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
             println!("=============================================\n");
-            client = DoubaoClient::new()?;
+            client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
             if let Err(e) = client.init(false).await {
                 // init 失败也要关闭已启动的浏览器进程，避免残留
                 client.close().await;
@@ -775,7 +780,7 @@ async fn run_direct(plan_path: &PathBuf, args: &Args) -> Result<()> {
     );
 
     // 2. 初始化浏览器（profile 锁冲突无头重试一次；其余无头失败才降级 UI 模式）
-    let mut client = DoubaoClient::new()?;
+    let mut client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
     match client.init(headless).await {
         Ok(()) => {}
         Err(e) if headless && is_profile_locked(&e) => {
@@ -785,7 +790,7 @@ async fn run_direct(plan_path: &PathBuf, args: &Args) -> Result<()> {
             println!("🔄 profile 锁冲突，不打开浏览器窗口，3s 后直接以无头模式重试一次...");
             client.close().await;
             tokio::time::sleep(Duration::from_secs(3)).await;
-            client = DoubaoClient::new()?;
+            client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
             if let Err(e2) = client.init(true).await {
                 client.close().await;
                 return Err(e2);
@@ -798,7 +803,7 @@ async fn run_direct(plan_path: &PathBuf, args: &Args) -> Result<()> {
             println!("🔄 现在会打开浏览器窗口，因为：{e}");
             println!("💡 如果出现验证码或登录页，请在浏览器中手动完成。");
             println!("=============================================\n");
-            client = DoubaoClient::new()?;
+            client = DoubaoClient::with_user_data_dir(args.user_data_dir.clone())?;
             if let Err(e) = client.init(false).await {
                 client.close().await;
                 return Err(e);
